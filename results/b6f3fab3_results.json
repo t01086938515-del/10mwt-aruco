@@ -1,0 +1,156 @@
+{
+  "elapsed_time_s": 9.855,
+  "distance_m": 10.0,
+  "speed_mps": 1.015,
+  "speed_kmph": 3.653,
+  "step_count": 17,
+  "cadence_spm": 103.5,
+  "step_length_m": 0.588,
+  "stride_length_m": 1.25,
+  "step_time_s": 0.572,
+  "stride_time_s": 1.143,
+  "left_step_length_m": 1.184,
+  "right_step_length_m": 1.203,
+  "step_length_si": 1.6,
+  "left_step_time_s": 1.019,
+  "right_step_time_s": 1.184,
+  "step_time_si": 14.9,
+  "left_swing_time_s": null,
+  "right_swing_time_s": null,
+  "swing_time_si": null,
+  "left_stance_time_s": 0.804,
+  "right_stance_time_s": 0.804,
+  "stance_time_si": 0.0,
+  "left_swing_stance_ratio": null,
+  "right_swing_stance_ratio": null,
+  "swing_stance_si": null,
+  "overall_symmetry_index": 5.5,
+  "step_events": [
+    {
+      "time": 7.353948075201432,
+      "frame_idx": 441,
+      "leading_foot": "left",
+      "left_x": 1833.284423828125,
+      "right_x": 1838.7462158203125
+    },
+    {
+      "time": 7.904243509400178,
+      "frame_idx": 474,
+      "leading_foot": "right",
+      "left_x": 1748.0665283203125,
+      "right_x": 1738.303955078125
+    },
+    {
+      "time": 8.60461951656222,
+      "frame_idx": 516,
+      "leading_foot": "left",
+      "left_x": 1629.689208984375,
+      "right_x": 1632.306640625
+    },
+    {
+      "time": 9.104888093106535,
+      "frame_idx": 546,
+      "leading_foot": "right",
+      "left_x": 1535.7698974609375,
+      "right_x": 1547.357666015625
+    },
+    {
+      "time": 9.755237242614145,
+      "frame_idx": 585,
+      "leading_foot": "left",
+      "left_x": 1430.32275390625,
+      "right_x": 1450.190673828125
+    },
+    {
+      "time": 10.355559534467323,
+      "frame_idx": 621,
+      "leading_foot": "right",
+      "left_x": 1323.84033203125,
+      "right_x": 1326.518798828125
+    },
+    {
+      "time": 10.955881826320502,
+      "frame_idx": 657,
+      "leading_foot": "left",
+      "left_x": 1215.3447265625,
+      "right_x": 1230.10546875
+    },
+    {
+      "time": 11.556204118173678,
+      "frame_idx": 693,
+      "leading_foot": "right",
+      "left_x": 1109.517333984375,
+      "right_x": 1111.7554931640625
+    },
+    {
+      "time": 12.106499552372425,
+      "frame_idx": 726,
+      "leading_foot": "left",
+      "left_x": 1021.7603759765625,
+      "right_x": 1015.2886962890625
+    },
+    {
+      "time": 12.756848701880035,
+      "frame_idx": 765,
+      "leading_foot": "right",
+      "left_x": 890.5940551757812,
+      "right_x": 895.1878051757812
+    },
+    {
+      "time": 13.307144136078781,
+      "frame_idx": 798,
+      "leading_foot": "left",
+      "left_x": 792.4686279296875,
+      "right_x": 800.3785400390625
+    },
+    {
+      "time": 13.957493285586391,
+      "frame_idx": 837,
+      "leading_foot": "right",
+      "left_x": 668.5540161132812,
+      "right_x": 672.63623046875
+    },
+    {
+      "time": 14.457761862130706,
+      "frame_idx": 867,
+      "leading_foot": "left",
+      "left_x": 590.4959716796875,
+      "right_x": 586.8657836914062
+    },
+    {
+      "time": 15.008057296329453,
+      "frame_idx": 900,
+      "leading_foot": "right",
+      "left_x": 506.2652893066406,
+      "right_x": 466.6782531738281
+    },
+    {
+      "time": 15.058084153983884,
+      "frame_idx": 903,
+      "leading_foot": "left",
+      "left_x": 458.18536376953125,
+      "right_x": 488.46331787109375
+    },
+    {
+      "time": 15.158137869292748,
+      "frame_idx": 909,
+      "leading_foot": "right",
+      "left_x": 447.177978515625,
+      "right_x": 450.5419921875
+    },
+    {
+      "time": 15.508325872873769,
+      "frame_idx": 930,
+      "leading_foot": "left",
+      "left_x": 370.6406555175781,
+      "right_x": 391.71514892578125
+    }
+  ],
+  "clinical": {
+    "speed_category": "정상 보행",
+    "fall_risk": "낮음",
+    "community_ambulation": "지역사회 보행 가능",
+    "recommendations": []
+  },
+  "analysis_mode": "lateral"
+}

@@ -1,0 +1,304 @@
+{
+  "elapsed_time_s": 7.354,
+  "distance_m": 10.0,
+  "speed_mps": 1.36,
+  "speed_kmph": 4.895,
+  "step_count": 11,
+  "cadence_spm": 89.7,
+  "step_length_m": 0.909,
+  "stride_length_m": 2.0,
+  "step_time_s": 0.56,
+  "stride_time_s": 1.121,
+  "left_stride_time_s": 1.121,
+  "right_stride_time_s": 1.188,
+  "stride_time_si": 5.9,
+  "left_step_length_m": 0.536,
+  "right_step_length_m": 0.962,
+  "step_length_si": 57.0,
+  "left_step_time_s": 0.43,
+  "right_step_time_s": 0.69,
+  "step_time_si": 46.4,
+  "left_swing_time_s": 0.46,
+  "right_swing_time_s": 0.513,
+  "swing_time_si": 11.0,
+  "left_stance_time_s": 0.513,
+  "right_stance_time_s": 0.46,
+  "stance_time_si": 11.0,
+  "left_swing_stance_ratio": 0.9,
+  "right_swing_stance_ratio": 1.12,
+  "swing_stance_si": 11.0,
+  "left_swing_pct": 47.3,
+  "right_swing_pct": 52.7,
+  "left_stance_pct": 52.7,
+  "right_stance_pct": 47.3,
+  "left_stride_length_m": 1.488,
+  "right_stride_length_m": 1.576,
+  "stride_length_si": 5.7,
+  "overall_symmetry_index": 23.7,
+  "step_events": [
+    {
+      "time": 8.204772065955384,
+      "frame_idx": 492,
+      "leading_foot": "left",
+      "left_x": 238.06240844726562,
+      "right_x": 251.45254516601562
+    },
+    {
+      "time": 8.805121241513094,
+      "frame_idx": 528,
+      "leading_foot": "right",
+      "left_x": 357.77850341796875,
+      "right_x": 362.59796142578125
+    },
+    {
+      "time": 9.355441319107662,
+      "frame_idx": 561,
+      "leading_foot": "left",
+      "left_x": 447.0343017578125,
+      "right_x": 470.05352783203125
+    },
+    {
+      "time": 10.005819592628516,
+      "frame_idx": 600,
+      "leading_foot": "right",
+      "left_x": 588.494140625,
+      "right_x": 588.6066284179688
+    },
+    {
+      "time": 10.556139670223084,
+      "frame_idx": 633,
+      "leading_foot": "left",
+      "left_x": 677.9205932617188,
+      "right_x": 707.6550903320312
+    },
+    {
+      "time": 11.25654704170708,
+      "frame_idx": 675,
+      "leading_foot": "right",
+      "left_x": 819.7197875976562,
+      "right_x": 819.3781127929688
+    },
+    {
+      "time": 11.806867119301648,
+      "frame_idx": 708,
+      "leading_foot": "left",
+      "left_x": 908.89892578125,
+      "right_x": 917.2014770507812
+    },
+    {
+      "time": 12.60733268671193,
+      "frame_idx": 756,
+      "leading_foot": "right",
+      "left_x": 1082.0577392578125,
+      "right_x": 1132.5244140625
+    },
+    {
+      "time": 12.857478176527643,
+      "frame_idx": 771,
+      "leading_foot": "left",
+      "left_x": 1155.1463623046875,
+      "right_x": 1174.6507568359375
+    },
+    {
+      "time": 13.557885548011638,
+      "frame_idx": 813,
+      "leading_foot": "right",
+      "left_x": 1347.350341796875,
+      "right_x": 1335.64990234375
+    },
+    {
+      "time": 13.808031037827352,
+      "frame_idx": 828,
+      "leading_foot": "left",
+      "left_x": 1386.797119140625,
+      "right_x": 1415.873779296875
+    }
+  ],
+  "clinical": {
+    "speed_category": "빠른 보행",
+    "fall_risk": "낮음",
+    "community_ambulation": "지역사회 보행 가능",
+    "recommendations": []
+  },
+  "analysis_mode": "lateral",
+  "judgment": {
+    "variables": [
+      {
+        "variable_name": "gait_velocity_ms",
+        "display_name": "보행속도",
+        "measured_value": 1.4,
+        "unit": "m/s",
+        "normal_range": "1.0~1.4m/s",
+        "status": "정상",
+        "deviation": null,
+        "direction": null,
+        "clinical_comment": "",
+        "color": "green"
+      },
+      {
+        "variable_name": "cadence_spm",
+        "display_name": "분속수 (Cadence)",
+        "measured_value": 89.7,
+        "unit": "steps/min",
+        "normal_range": "100~120steps/min",
+        "status": "하한 미달",
+        "deviation": 10.3,
+        "direction": "↓",
+        "clinical_comment": "분속수 감소: 느린 보행 반영",
+        "color": "orange"
+      },
+      {
+        "variable_name": "step_length_cm",
+        "display_name": "보폭 (Step Length)",
+        "measured_value": 90.9,
+        "unit": "cm",
+        "normal_range": "55~70cm",
+        "status": "상한 초과",
+        "deviation": 20.9,
+        "direction": "↑",
+        "clinical_comment": "보폭 증가: 정상 범위 확인",
+        "color": "orange"
+      },
+      {
+        "variable_name": "stride_length_cm",
+        "display_name": "활보장 (Stride Length)",
+        "measured_value": 200.0,
+        "unit": "cm",
+        "normal_range": "110~140cm",
+        "status": "상한 초과",
+        "deviation": 60.0,
+        "direction": "↑",
+        "clinical_comment": "활보장 증가: 정상 범위 확인",
+        "color": "orange"
+      },
+      {
+        "variable_name": "step_time_s",
+        "display_name": "Step Time",
+        "measured_value": 0.6,
+        "unit": "s",
+        "normal_range": "0.5~0.6s",
+        "status": "정상",
+        "deviation": null,
+        "direction": null,
+        "clinical_comment": "",
+        "color": "green"
+      },
+      {
+        "variable_name": "stride_time_s",
+        "display_name": "Stride Time (보행주기)",
+        "measured_value": 1.1,
+        "unit": "s",
+        "normal_range": "1.0~1.2s",
+        "status": "정상",
+        "deviation": null,
+        "direction": null,
+        "clinical_comment": "",
+        "color": "green"
+      },
+      {
+        "variable_name": "stance_ratio_pct",
+        "display_name": "입각기 비율 (Stance)",
+        "measured_value": 50.0,
+        "unit": "%",
+        "normal_range": "58~62%",
+        "status": "하한 미달",
+        "deviation": 8.0,
+        "direction": "↓",
+        "clinical_comment": "입각기 감소: 빠른 보행 또는 측정 오차 확인 필요",
+        "color": "orange"
+      },
+      {
+        "variable_name": "swing_ratio_pct",
+        "display_name": "유각기 비율 (Swing)",
+        "measured_value": 50.0,
+        "unit": "%",
+        "normal_range": "38~42%",
+        "status": "상한 초과",
+        "deviation": 8.0,
+        "direction": "↑",
+        "clinical_comment": "유각기 증가: 빠른 보행 시 정상적 변화",
+        "color": "orange"
+      },
+      {
+        "variable_name": "double_support_pct",
+        "display_name": "양하지 지지기 (Double Support)",
+        "measured_value": null,
+        "unit": "%",
+        "normal_range": "18~24%",
+        "status": "N/A",
+        "deviation": null,
+        "direction": null,
+        "clinical_comment": "",
+        "color": "gray"
+      },
+      {
+        "variable_name": "single_support_pct",
+        "display_name": "단하지 지지기 (Single Support)",
+        "measured_value": null,
+        "unit": "%",
+        "normal_range": "38~40%",
+        "status": "N/A",
+        "deviation": null,
+        "direction": null,
+        "clinical_comment": "",
+        "color": "gray"
+      },
+      {
+        "variable_name": "stride_length_cv",
+        "display_name": "활보장 변동성 (CV)",
+        "measured_value": null,
+        "unit": "%",
+        "normal_range": "0~4.4%",
+        "status": "N/A",
+        "deviation": null,
+        "direction": null,
+        "clinical_comment": "",
+        "color": "gray"
+      },
+      {
+        "variable_name": "swing_time_cv",
+        "display_name": "유각기 시간 변동성 (CV)",
+        "measured_value": null,
+        "unit": "%",
+        "normal_range": "0~6.6%",
+        "status": "N/A",
+        "deviation": null,
+        "direction": null,
+        "clinical_comment": "",
+        "color": "gray"
+      },
+      {
+        "variable_name": "step_length_cv",
+        "display_name": "보폭 변동성 (CV)",
+        "measured_value": null,
+        "unit": "%",
+        "normal_range": "0~5.9%",
+        "status": "N/A",
+        "deviation": null,
+        "direction": null,
+        "clinical_comment": "",
+        "color": "gray"
+      },
+      {
+        "variable_name": "stance_time_cv",
+        "display_name": "입각기 시간 변동성 (CV)",
+        "measured_value": null,
+        "unit": "%",
+        "normal_range": "0~5.3%",
+        "status": "N/A",
+        "deviation": null,
+        "direction": null,
+        "clinical_comment": "",
+        "color": "gray"
+      }
+    ],
+    "patterns": [],
+    "velocity": {
+      "speed_mps": 1.36,
+      "classification": "정상",
+      "color": "green",
+      "alerts": []
+    },
+    "reference_note": "[참고사항]\n- 보행속도 판정은 Perry et al.(1995) 기능적 보행 분류에 근거합니다.\n- 보행속도를 제외한 변수의 경/중/심 판정은 현재 합의된 임상 근거가 없어 정상 범위 대비 편차만 제공합니다.\n- 정상 참고치는 한국인 성인 대상 연구(Kim et al. 2024; Kim & Lee 2020; Cho et al. 2004)와 국제 문헌을 종합한 대략적 범위입니다.\n- 측면 영상 기반 측정은 GAITRite 등 gold standard 대비 오차가 있을 수 있습니다.\n- 최종 임상 해석은 반드시 전문가(물리치료사, 재활의학과)가 수행해야 합니다."
+  }
+}

@@ -1,0 +1,408 @@
+@import "tailwindcss";
+
+/* Enable class-based dark mode for Tailwind v4 */
+@variant dark (&:where(.dark, .dark *));
+
+/* Trackit.so inspired design system */
+:root {
+  /* Background colors - clean whites */
+  --background: 0 0% 100%;           /* #ffffff */
+  --background-subtle: 0 0% 98%;     /* #fafafa */
+  --background-muted: 0 0% 96%;      /* #f5f5f5 */
+
+  /* Text colors - crisp blacks */
+  --foreground: 0 0% 9%;             /* #171717 */
+  --foreground-muted: 0 0% 45%;      /* #737373 */
+
+  /* Card */
+  --card: 0 0% 100%;
+  --card-foreground: 0 0% 9%;
+
+  /* Popover */
+  --popover: 0 0% 100%;
+  --popover-foreground: 0 0% 9%;
+
+  /* Primary - Trackit Blue */
+  --primary: 202 100% 50%;           /* #0097fe */
+  --primary-foreground: 0 0% 100%;
+
+  /* Secondary - Light gray */
+  --secondary: 0 0% 96%;             /* #f5f5f5 */
+  --secondary-foreground: 0 0% 9%;
+
+  /* Muted */
+  --muted: 0 0% 96%;
+  --muted-foreground: 0 0% 45%;
+
+  /* Accent colors from Trackit */
+  --accent: 0 0% 96%;
+  --accent-foreground: 0 0% 9%;
+  --accent-blue: 202 100% 50%;       /* #0097fe */
+  --accent-green: 120 100% 34%;      /* #00ad09 */
+  --accent-purple: 260 100% 70%;     /* #9966ff */
+  --accent-pink: 295 100% 63%;       /* #f347ff */
+  --accent-gold: 45 78% 46%;         /* #d4a217 */
+  --accent-red: 0 100% 64%;          /* #ff4747 */
+
+  /* Destructive */
+  --destructive: 0 100% 64%;         /* #ff4747 */
+  --destructive-foreground: 0 0% 100%;
+
+  /* Border - subtle grays */
+  --border: 0 0% 90%;                /* #e5e5e5 */
+  --border-subtle: 210 22% 92%;      /* #dde5ed */
+  --input: 0 0% 90%;
+
+  /* Ring */
+  --ring: 202 100% 50%;
+
+  /* Radius - more rounded like Trackit */
+  --radius: 0.75rem;                 /* 12px base */
+  --radius-sm: 0.5rem;               /* 8px */
+  --radius-md: 1rem;                 /* 16px */
+  --radius-lg: 1.25rem;              /* 20px */
+  --radius-xl: 1.5rem;               /* 24px */
+  --radius-full: 9999px;
+
+  /* Success/Warning */
+  --success: 120 100% 34%;           /* #00ad09 */
+  --success-foreground: 0 0% 100%;
+  --warning: 45 78% 46%;             /* #d4a217 */
+  --warning-foreground: 0 0% 100%;
+}
+
+.dark {
+  /* Dark mode - Trackit inspired */
+  --background: 0 0% 7%;             /* #121212 */
+  --background-subtle: 0 0% 10%;     /* #1a1a1a */
+  --background-muted: 0 0% 14%;      /* #242424 */
+
+  --foreground: 0 0% 95%;            /* #f2f2f2 */
+  --foreground-muted: 0 0% 60%;      /* #999999 */
+
+  --card: 0 0% 10%;
+  --card-foreground: 0 0% 95%;
+
+  --popover: 0 0% 10%;
+  --popover-foreground: 0 0% 95%;
+
+  --primary: 202 100% 55%;           /* lighter blue for dark mode */
+  --primary-foreground: 0 0% 100%;
+
+  --secondary: 0 0% 14%;
+  --secondary-foreground: 0 0% 95%;
+
+  --muted: 0 0% 14%;
+  --muted-foreground: 0 0% 60%;
+
+  --accent: 0 0% 14%;
+  --accent-foreground: 0 0% 95%;
+
+  --destructive: 0 100% 60%;
+  --destructive-foreground: 0 0% 100%;
+
+  --border: 0 0% 20%;                /* #333333 */
+  --border-subtle: 0 0% 18%;
+  --input: 0 0% 20%;
+
+  --ring: 202 100% 55%;
+
+  --success: 120 80% 45%;
+  --success-foreground: 0 0% 100%;
+  --warning: 45 90% 55%;
+  --warning-foreground: 0 0% 0%;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+body {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-feature-settings: "rlig" 1, "calt" 1;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Trackit-style Typography */
+h1, h2, h3, h4, h5, h6 {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+
+h1 { font-size: 2.5rem; }   /* 40px */
+h2 { font-size: 1.875rem; } /* 30px */
+h3 { font-size: 1.5rem; }   /* 24px */
+h4 { font-size: 1.25rem; }  /* 20px */
+
+/* Links - no underline by default */
+a {
+  color: inherit;
+  text-decoration: none;
+  transition: all 0.2s ease;
+}
+
+a:hover {
+  text-decoration: none;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: hsl(var(--muted));
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted-foreground) / 0.3);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.5);
+}
+
+/* ===== Micro Animations ===== */
+
+/* 페이지 전환 애니메이션 */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeInScale {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes slideInLeft {
+  from {
+    opacity: 0;
+    transform: translateX(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes slideInRight {
+  from {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* 스켈레톤 shimmer 효과 */
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+/* 펄스 효과 */
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* 바운스 효과 */
+@keyframes bounce {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+/* 스핀 효과 */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 유틸리티 클래스 */
+.animate-fade-in {
+  animation: fadeIn 0.3s ease-out forwards;
+}
+
+.animate-fade-in-up {
+  animation: fadeInUp 0.4s ease-out forwards;
+}
+
+.animate-fade-in-scale {
+  animation: fadeInScale 0.3s ease-out forwards;
+}
+
+.animate-slide-in-left {
+  animation: slideInLeft 0.3s ease-out forwards;
+}
+
+.animate-slide-in-right {
+  animation: slideInRight 0.3s ease-out forwards;
+}
+
+.animate-shimmer {
+  background: linear-gradient(
+    90deg,
+    hsl(var(--muted)) 0%,
+    hsl(var(--muted-foreground) / 0.1) 50%,
+    hsl(var(--muted)) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+.animate-pulse-slow {
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.animate-bounce-subtle {
+  animation: bounce 0.6s ease-in-out;
+}
+
+/* 스태거 딜레이 */
+.stagger-1 { animation-delay: 0.05s; }
+.stagger-2 { animation-delay: 0.1s; }
+.stagger-3 { animation-delay: 0.15s; }
+.stagger-4 { animation-delay: 0.2s; }
+.stagger-5 { animation-delay: 0.25s; }
+.stagger-6 { animation-delay: 0.3s; }
+
+/* 버튼 호버 효과 */
+.btn-hover {
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.btn-hover:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px hsl(var(--primary) / 0.25);
+}
+
+.btn-hover:active {
+  transform: translateY(0);
+  box-shadow: 0 2px 4px hsl(var(--primary) / 0.15);
+}
+
+/* Trackit-style card hover */
+.card-hover {
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  border-radius: var(--radius-lg);
+}
+
+.card-hover:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 20px 40px hsl(var(--foreground) / 0.08);
+}
+
+/* Trackit-style cards */
+.trackit-card {
+  background: hsl(var(--card));
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius-xl);
+  padding: 1.5rem;
+  transition: all 0.3s ease;
+}
+
+.trackit-card:hover {
+  border-color: hsl(var(--border-subtle));
+  box-shadow: 0 8px 30px hsl(var(--foreground) / 0.06);
+}
+
+/* Trackit-style gradient orbs (decorative) */
+.gradient-orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(80px);
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.gradient-orb-blue {
+  background: radial-gradient(circle, hsl(var(--accent-blue)) 0%, transparent 70%);
+}
+
+.gradient-orb-purple {
+  background: radial-gradient(circle, hsl(var(--accent-purple)) 0%, transparent 70%);
+}
+
+.gradient-orb-green {
+  background: radial-gradient(circle, hsl(var(--accent-green)) 0%, transparent 70%);
+}
+
+/* 링크/아이템 호버 효과 */
+.item-hover {
+  transition: all 0.2s ease;
+}
+
+.item-hover:hover {
+  background-color: hsl(var(--accent));
+  transform: translateX(4px);
+}
+
+/* 아이콘 호버 효과 */
+.icon-hover {
+  transition: all 0.2s ease;
+}
+
+.icon-hover:hover {
+  transform: scale(1.1);
+  color: hsl(var(--primary));
+}
+
+/* 포커스 링 */
+.focus-ring {
+  transition: box-shadow 0.2s ease;
+}
+
+.focus-ring:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px hsl(var(--primary) / 0.3);
+}

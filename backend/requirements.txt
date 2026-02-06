@@ -1,0 +1,15 @@
+# FastAPI & Server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# Computer Vision
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# AI/ML
+ultralytics>=8.0.200
+torch>=2.0.0
+
+# Signal Processing
+scipy>=1.11.0
