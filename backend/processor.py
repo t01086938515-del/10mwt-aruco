@@ -378,97 +378,92 @@ class FrameProcessor:
             left_x_smooth, right_x_smooth = left_x, right_x
             left_y_smooth, right_y_smooth = left_y, right_y
 
-        # ═══ Step Detection: 속도 기반 발 접지(Heel Strike) 감지 ═══
-        # 발꿈치 Y속도가 양수→0/음수로 전환되는 순간 = 발이 내려오다 멈춤 = 접지
-        # 화면 좌표계: Y 증가 = 아래로 → heel_vy > 0 = 발이 내려가는 중
+        # ═══ Step Detection: 적응형 3중 필터 Heel Strike 감지 ═══
+        # 필터 1: heel Y 로컬 최대값 (발뒤꿈치가 바닥에 닿는 순간)
+        # 필터 2: heel X 속도 ≈ 0 (실제 HS에서는 해당 발의 수평 이동 정지)
+        # 필터 3: 최소 간격 0.35초 (정상 보행 기준 false positive 제거)
 
         effective_fps = len(times) / (times[-1] - times[0]) if len(times) > 1 and times[-1] > times[0] else self.fps
+        min_distance = max(3, int(effective_fps * 0.3))
 
-        # heel Y좌표 추출 및 스무딩
+        # heel X/Y 좌표 추출 및 스무딩
+        left_heel_x_raw = np.array([h.get('left_heel_x', h['left_x']) for h in segment])
         left_heel_y_raw = np.array([h.get('left_heel_y', h['left_y']) for h in segment])
+        right_heel_x_raw = np.array([h.get('right_heel_x', h['right_x']) for h in segment])
         right_heel_y_raw = np.array([h.get('right_heel_y', h['right_y']) for h in segment])
         if len(left_heel_y_raw) > 5:
+            left_heel_x_sm = np.convolve(left_heel_x_raw, kernel, mode='same')
             left_heel_y_sm = np.convolve(left_heel_y_raw, kernel, mode='same')
+            right_heel_x_sm = np.convolve(right_heel_x_raw, kernel, mode='same')
             right_heel_y_sm = np.convolve(right_heel_y_raw, kernel, mode='same')
         else:
-            left_heel_y_sm = left_heel_y_raw
-            right_heel_y_sm = right_heel_y_raw
+            left_heel_x_sm, left_heel_y_sm = left_heel_x_raw, left_heel_y_raw
+            right_heel_x_sm, right_heel_y_sm = right_heel_x_raw, right_heel_y_raw
 
-        # 지면 Y 기준 (heel Y의 상위 80% = 지면에 가까운 값)
-        all_heel_y_for_ground = np.concatenate([left_heel_y_sm, right_heel_y_sm])
-        ground_y_step = np.percentile(all_heel_y_for_ground, 80)
-        ground_margin = max(15, (np.max(all_heel_y_for_ground) - np.min(all_heel_y_for_ground)) * 0.25)
-
-        def detect_foot_contacts(ankle_x_smooth, heel_y_smooth, times_arr, fps, min_gap_s=0.25):
-            """속도 기반 발 접지 감지
+        def detect_heel_strikes(heel_x_smooth, heel_y_smooth, times_arr, min_dist, min_gap_s=0.35):
+            """적응형 3중 필터 Heel Strike 감지
 
             Args:
-                ankle_x_smooth: 스무딩된 발목 X좌표 배열
+                heel_x_smooth: 스무딩된 발꿈치 X좌표 배열
                 heel_y_smooth: 스무딩된 발꿈치 Y좌표 배열
                 times_arr: 시간 배열 (초)
-                fps: 프레임율
-                min_gap_s: 같은 발 연속 접지 최소 간격 (초)
+                min_dist: find_peaks 최소 거리 (프레임)
+                min_gap_s: 같은 발 연속 HS 최소 간격 (초)
 
             Returns:
-                접지 프레임 인덱스 리스트
+                heel strike 프레임 인덱스 리스트
             """
             if len(heel_y_smooth) < 5:
                 return []
 
-            # 1) 발꿈치 Y속도: 양수 = 아래로 내려감, 음수 = 위로 올라감
-            heel_vy = np.gradient(heel_y_smooth, times_arr)
+            # ── 필터 1: heel Y 로컬 최대값 (화면 좌표: Y↑ = 아래 = 바닥) ──
+            peaks, _ = signal.find_peaks(heel_y_smooth, distance=min_dist, prominence=3)
+            if len(peaks) == 0:
+                return []
 
-            # 2) 발목 X속도 (접지 시 감속 확인용)
-            ankle_vx = np.gradient(ankle_x_smooth, times_arr)
+            # ── 필터 2: heel X 속도 필터 (접지 시 수평 이동 ≈ 0) ──
+            heel_vx = np.gradient(heel_x_smooth, times_arr)
+            abs_heel_vx = np.abs(heel_vx)
+            vx_median = np.median(abs_heel_vx)
+            vx_threshold = vx_median * 2.0  # 중앙값의 2배 이하만 유지
 
-            # 3) heel_vy 부호 변화 감지: 양수→음수/0 = 내려오다 멈춤 (접지)
-            vy_sign = np.sign(heel_vy)
-            vy_sign_diff = np.diff(vy_sign)
-            # 음수 변화 = 양수(내려감)→0/음수(올라감) 전환점
-            candidates = np.where(vy_sign_diff < 0)[0]
+            filtered_peaks = []
+            for idx in peaks:
+                if abs_heel_vx[idx] <= vx_threshold:
+                    filtered_peaks.append(idx)
 
-            contacts = []
-            for idx in candidates:
-                # 실제 접지 시점은 변화 직후 프레임
-                contact_idx = idx + 1
-                if contact_idx >= len(heel_y_smooth):
-                    continue
-
-                # 4) 지면 근접 확인: heel_y가 ground 근처여야 함
-                if heel_y_smooth[contact_idx] < ground_y_step - ground_margin:
-                    continue  # 지면에서 너무 멀면 스킵 (공중에서의 속도 변화)
-
-                # 5) 최소 간격 필터
-                if contacts:
-                    dt = times_arr[contact_idx] - times_arr[contacts[-1]]
+            # ── 필터 3: 최소 시간 간격 (0.35초) ──
+            final_peaks = []
+            for idx in filtered_peaks:
+                if final_peaks:
+                    dt = times_arr[idx] - times_arr[final_peaks[-1]]
                     if dt < min_gap_s:
                         continue
+                final_peaks.append(idx)
 
-                contacts.append(contact_idx)
-
-            return contacts
+            return final_peaks
 
         step_events = []
         try:
-            left_contacts = detect_foot_contacts(left_x_smooth, left_heel_y_sm, times, effective_fps)
-            right_contacts = detect_foot_contacts(right_x_smooth, right_heel_y_sm, times, effective_fps)
+            left_hs = detect_heel_strikes(left_heel_x_sm, left_heel_y_sm, times, min_distance)
+            right_hs = detect_heel_strikes(right_heel_x_sm, right_heel_y_sm, times, min_distance)
 
-            print(f"[Processor] Velocity-based heel strike detection: L contacts={len(left_contacts)}, R contacts={len(right_contacts)}", flush=True)
+            print(f"[Processor] Adaptive 3-filter HS detection: L={len(left_hs)}, R={len(right_hs)}, min_dist={min_distance}", flush=True)
 
-            # 모든 접지 이벤트를 시간순으로 합치기
-            all_contacts = []
-            for idx in left_contacts:
+            # 모든 HS 이벤트를 시간순으로 합치기
+            all_hs = []
+            for idx in left_hs:
                 if idx < len(times):
-                    all_contacts.append({
+                    all_hs.append({
                         'time': float(times[idx]),
                         'frame_idx': segment[idx]['frame_idx'],
                         'leading_foot': 'left',
                         'left_x': float(left_x[idx]),
                         'right_x': float(right_x[idx]),
                     })
-            for idx in right_contacts:
+            for idx in right_hs:
                 if idx < len(times):
-                    all_contacts.append({
+                    all_hs.append({
                         'time': float(times[idx]),
                         'frame_idx': segment[idx]['frame_idx'],
                         'leading_foot': 'right',
@@ -476,17 +471,16 @@ class FrameProcessor:
                         'right_x': float(right_x[idx]),
                     })
 
-            # 시간 순서로 정렬
-            all_contacts.sort(key=lambda e: e['time'])
+            all_hs.sort(key=lambda e: e['time'])
 
             # ── START 직후 진입 중 스텝 제외 ──
             step_buffer_s = 0.3
-            all_contacts = [e for e in all_contacts if e['time'] >= start_t + step_buffer_s]
-            print(f"[Processor] After start buffer ({step_buffer_s}s): {len(all_contacts)} contacts", flush=True)
+            all_hs = [e for e in all_hs if e['time'] >= start_t + step_buffer_s]
+            print(f"[Processor] After start buffer ({step_buffer_s}s): {len(all_hs)} heel strikes", flush=True)
 
-            step_events = all_contacts
+            step_events = all_hs
         except Exception as e:
-            print(f"[Processor] Velocity-based step detection error: {e}", flush=True)
+            print(f"[Processor] Adaptive HS detection error: {e}", flush=True)
 
         # 폴백: X좌표 교차 방식
         if len(step_events) < 2:
