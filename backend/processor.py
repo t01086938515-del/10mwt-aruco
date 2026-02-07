@@ -378,59 +378,115 @@ class FrameProcessor:
             left_x_smooth, right_x_smooth = left_x, right_x
             left_y_smooth, right_y_smooth = left_y, right_y
 
-        # ═══ Step Detection: Y좌표 피크 기반 (측면 카메라에 적합) ═══
-        # 발이 들릴 때 Y값이 감소 (화면 위쪽) → -Y의 피크 = 발이 최고점
-        # 이후 다시 Y가 증가 (착지) → Y의 피크 = 발이 착지하는 순간
-        # 양발의 착지 순간을 합쳐서 step으로 계산
+        # ═══ Step Detection: 속도 기반 발 접지(Heel Strike) 감지 ═══
+        # 발꿈치 Y속도가 양수→0/음수로 전환되는 순간 = 발이 내려오다 멈춤 = 접지
+        # 화면 좌표계: Y 증가 = 아래로 → heel_vy > 0 = 발이 내려가는 중
 
-        # 보행 주파수 기반 최소 간격: ~0.3초 (프레임 단위)
         effective_fps = len(times) / (times[-1] - times[0]) if len(times) > 1 and times[-1] > times[0] else self.fps
-        min_distance = max(2, int(effective_fps * 0.25))
+
+        # heel Y좌표 추출 및 스무딩
+        left_heel_y_raw = np.array([h.get('left_heel_y', h['left_y']) for h in segment])
+        right_heel_y_raw = np.array([h.get('right_heel_y', h['right_y']) for h in segment])
+        if len(left_heel_y_raw) > 5:
+            left_heel_y_sm = np.convolve(left_heel_y_raw, kernel, mode='same')
+            right_heel_y_sm = np.convolve(right_heel_y_raw, kernel, mode='same')
+        else:
+            left_heel_y_sm = left_heel_y_raw
+            right_heel_y_sm = right_heel_y_raw
+
+        # 지면 Y 기준 (heel Y의 상위 80% = 지면에 가까운 값)
+        all_heel_y_for_ground = np.concatenate([left_heel_y_sm, right_heel_y_sm])
+        ground_y_step = np.percentile(all_heel_y_for_ground, 80)
+        ground_margin = max(15, (np.max(all_heel_y_for_ground) - np.min(all_heel_y_for_ground)) * 0.25)
+
+        def detect_foot_contacts(ankle_x_smooth, heel_y_smooth, times_arr, fps, min_gap_s=0.25):
+            """속도 기반 발 접지 감지
+
+            Args:
+                ankle_x_smooth: 스무딩된 발목 X좌표 배열
+                heel_y_smooth: 스무딩된 발꿈치 Y좌표 배열
+                times_arr: 시간 배열 (초)
+                fps: 프레임율
+                min_gap_s: 같은 발 연속 접지 최소 간격 (초)
+
+            Returns:
+                접지 프레임 인덱스 리스트
+            """
+            if len(heel_y_smooth) < 5:
+                return []
+
+            # 1) 발꿈치 Y속도: 양수 = 아래로 내려감, 음수 = 위로 올라감
+            heel_vy = np.gradient(heel_y_smooth, times_arr)
+
+            # 2) 발목 X속도 (접지 시 감속 확인용)
+            ankle_vx = np.gradient(ankle_x_smooth, times_arr)
+
+            # 3) heel_vy 부호 변화 감지: 양수→음수/0 = 내려오다 멈춤 (접지)
+            vy_sign = np.sign(heel_vy)
+            vy_sign_diff = np.diff(vy_sign)
+            # 음수 변화 = 양수(내려감)→0/음수(올라감) 전환점
+            candidates = np.where(vy_sign_diff < 0)[0]
+
+            contacts = []
+            for idx in candidates:
+                # 실제 접지 시점은 변화 직후 프레임
+                contact_idx = idx + 1
+                if contact_idx >= len(heel_y_smooth):
+                    continue
+
+                # 4) 지면 근접 확인: heel_y가 ground 근처여야 함
+                if heel_y_smooth[contact_idx] < ground_y_step - ground_margin:
+                    continue  # 지면에서 너무 멀면 스킵 (공중에서의 속도 변화)
+
+                # 5) 최소 간격 필터
+                if contacts:
+                    dt = times_arr[contact_idx] - times_arr[contacts[-1]]
+                    if dt < min_gap_s:
+                        continue
+
+                contacts.append(contact_idx)
+
+            return contacts
 
         step_events = []
         try:
-            # 왼발: -Y 피크 = 발이 최고점 (스윙 중 발이 들린 순간)
-            left_peaks, left_props = signal.find_peaks(-left_y_smooth, distance=min_distance, prominence=5)
-            right_peaks, right_props = signal.find_peaks(-right_y_smooth, distance=min_distance, prominence=5)
+            left_contacts = detect_foot_contacts(left_x_smooth, left_heel_y_sm, times, effective_fps)
+            right_contacts = detect_foot_contacts(right_x_smooth, right_heel_y_sm, times, effective_fps)
 
-            print(f"[Processor] Y-peak step detection: L peaks={len(left_peaks)}, R peaks={len(right_peaks)}, min_dist={min_distance}", flush=True)
+            print(f"[Processor] Velocity-based heel strike detection: L contacts={len(left_contacts)}, R contacts={len(right_contacts)}", flush=True)
 
-            # 모든 피크를 시간 순서로 합치기
-            all_peaks = []
-            for idx in left_peaks:
+            # 모든 접지 이벤트를 시간순으로 합치기
+            all_contacts = []
+            for idx in left_contacts:
                 if idx < len(times):
-                    all_peaks.append({
+                    all_contacts.append({
                         'time': float(times[idx]),
                         'frame_idx': segment[idx]['frame_idx'],
                         'leading_foot': 'left',
                         'left_x': float(left_x[idx]),
                         'right_x': float(right_x[idx]),
-                        'peak_y': float(left_y[idx]),
                     })
-            for idx in right_peaks:
+            for idx in right_contacts:
                 if idx < len(times):
-                    all_peaks.append({
+                    all_contacts.append({
                         'time': float(times[idx]),
                         'frame_idx': segment[idx]['frame_idx'],
                         'leading_foot': 'right',
                         'left_x': float(left_x[idx]),
                         'right_x': float(right_x[idx]),
-                        'peak_y': float(right_y[idx]),
                     })
 
             # 시간 순서로 정렬
-            all_peaks.sort(key=lambda e: e['time'])
+            all_contacts.sort(key=lambda e: e['time'])
 
             # ── START 직후 진입 중 스텝 제외 ──
-            # 10mWT: 시작선 통과 후 첫 온전한 스텝부터 카운트
-            # 시작선 통과 후 0.3초 이내 피크는 진입 중 스텝이므로 제외
             step_buffer_s = 0.3
-            all_peaks = [e for e in all_peaks if e['time'] >= start_t + step_buffer_s]
-            print(f"[Processor] After start buffer ({step_buffer_s}s): {len(all_peaks)} peaks (removed early steps)", flush=True)
+            all_contacts = [e for e in all_contacts if e['time'] >= start_t + step_buffer_s]
+            print(f"[Processor] After start buffer ({step_buffer_s}s): {len(all_contacts)} contacts", flush=True)
 
-            step_events = all_peaks
+            step_events = all_contacts
         except Exception as e:
-            print(f"[Processor] Y-peak step detection error: {e}", flush=True)
+            print(f"[Processor] Velocity-based step detection error: {e}", flush=True)
 
         # 폴백: X좌표 교차 방식
         if len(step_events) < 2:
