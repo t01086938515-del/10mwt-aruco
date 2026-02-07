@@ -440,7 +440,16 @@ class FrameProcessor:
                 return []
 
             # ── 필터 1: heel Y 로컬 최대값 (화면 좌표: Y↑ = 아래 = 바닥) ──
-            peaks, _ = signal.find_peaks(heel_y_smooth, distance=min_dist, prominence=3)
+            # 측면 카메라에서 heel Y 변화 작음 (10~30px) → prominence 낮게 설정
+            y_range = np.max(heel_y_smooth) - np.min(heel_y_smooth)
+            prom = max(2, y_range * 0.08)
+            peaks, _ = signal.find_peaks(heel_y_smooth, distance=min_dist, prominence=prom)
+
+            # 피크 부족 시 prominence 더 낮춰서 재시도
+            if len(peaks) < 3:
+                prom_retry = max(1, y_range * 0.04)
+                peaks, _ = signal.find_peaks(heel_y_smooth, distance=min_dist, prominence=prom_retry)
+
             if len(peaks) == 0:
                 return []
 
@@ -448,12 +457,17 @@ class FrameProcessor:
             heel_vx = np.gradient(heel_x_smooth, times_arr)
             abs_heel_vx = np.abs(heel_vx)
             vx_median = np.median(abs_heel_vx)
-            vx_threshold = vx_median * 2.0  # 중앙값의 2배 이하만 유지
+            vx_threshold = vx_median * 2.5  # 중앙값의 2.5배 이하만 유지 (완화)
 
             filtered_peaks = []
             for idx in peaks:
                 if abs_heel_vx[idx] <= vx_threshold:
                     filtered_peaks.append(idx)
+
+            # 필터 2에서 너무 많이 제거되면 완화
+            if len(filtered_peaks) < 3 and len(peaks) >= 3:
+                vx_threshold_relaxed = vx_median * 4.0
+                filtered_peaks = [idx for idx in peaks if abs_heel_vx[idx] <= vx_threshold_relaxed]
 
             # ── 필터 3: 최소 시간 간격 (0.35초) ──
             final_peaks = []
@@ -500,6 +514,20 @@ class FrameProcessor:
 
             all_hs.sort(key=lambda e: e['time'])
 
+            # ── 양발 병합 후 bilateral 최소 간격 필터 (0.2s) ──
+            deduped = []
+            for ev in all_hs:
+                if deduped and (ev['time'] - deduped[-1]['time']) < 0.2:
+                    # 0.2초 이내 동시 이벤트 → heel Y가 더 큰 쪽(지면 가까운) 유지
+                    if ev['leading_foot'] != deduped[-1]['leading_foot']:
+                        curr_y = ev['left_y'] if ev['leading_foot'] == 'left' else ev['right_y']
+                        prev_y = deduped[-1]['left_y'] if deduped[-1]['leading_foot'] == 'left' else deduped[-1]['right_y']
+                        if curr_y > prev_y:
+                            deduped[-1] = ev
+                    continue
+                deduped.append(ev)
+            all_hs = deduped
+
             # ── START 직후 진입 중 스텝 제외 ──
             step_buffer_s = 0.3
             all_hs = [e for e in all_hs if e['time'] >= start_t + step_buffer_s]
@@ -509,16 +537,18 @@ class FrameProcessor:
         except Exception as e:
             print(f"[Processor] Adaptive HS detection error: {e}", flush=True)
 
-        # 폴백: X좌표 교차 방식
-        if len(step_events) < 2:
+        # 폴백: X좌표 교차 방식 (HS 감지 부족 시 보완)
+        if len(step_events) < 6:
+            hs_count = len(step_events)
             diff_x = left_x_smooth - right_x_smooth
             sign_changes = np.where(np.diff(np.sign(diff_x)))[0]
+            fallback_events = []
             for idx in sign_changes:
                 if idx < len(times):
                     leading_foot = 'left' if diff_x[idx] > 0 else 'right'
                     t_val = float(times[idx])
-                    if t_val >= start_t + 0.3:  # 동일 버퍼 적용
-                        step_events.append({
+                    if t_val >= start_t + 0.3:
+                        fallback_events.append({
                             'time': t_val,
                             'frame_idx': segment[idx]['frame_idx'],
                             'leading_foot': leading_foot,
@@ -527,7 +557,20 @@ class FrameProcessor:
                             'left_y': float(left_y[idx]),
                             'right_y': float(right_y[idx]),
                         })
-            print(f"[Processor] X-crossing fallback: {len(step_events)} steps", flush=True)
+            # HS 결과가 있으면 병합, 없으면 fallback만 사용
+            if hs_count > 0 and len(fallback_events) > hs_count:
+                # 병합 후 시간순 정렬 + bilateral dedup
+                merged = step_events + fallback_events
+                merged.sort(key=lambda e: e['time'])
+                deduped_merged = []
+                for ev in merged:
+                    if deduped_merged and (ev['time'] - deduped_merged[-1]['time']) < 0.2:
+                        continue
+                    deduped_merged.append(ev)
+                step_events = deduped_merged
+            elif hs_count == 0:
+                step_events = fallback_events
+            print(f"[Processor] X-crossing fallback: HS={hs_count} + fallback={len(fallback_events)} → merged={len(step_events)}", flush=True)
 
         step_count = len(step_events)
         result['step_events'] = step_events
@@ -542,8 +585,16 @@ class FrameProcessor:
         ppm = self.aruco.pixels_per_meter if self.aruco.pixels_per_meter else 100
         print(f"[Processor] Homography calibrated: {self.perspective_corrector.calibrated}", flush=True)
 
-        # 케이던스 (steps per minute)
-        cadence = (step_count / elapsed) * 60
+        # 케이던스 (steps per minute) - 중앙값 기반 (이상치 강건)
+        cadence = (step_count / elapsed) * 60  # 기본 계산
+        # step interval 중앙값으로 보강 (0.3s~2.0s 범위만)
+        _step_intervals = []
+        for i in range(1, len(step_events)):
+            dt = step_events[i]['time'] - step_events[i-1]['time']
+            if 0.3 <= dt <= 2.0:
+                _step_intervals.append(dt)
+        if _step_intervals:
+            cadence = 60.0 / np.median(_step_intervals)
         if 30 <= cadence <= 200:
             result['cadence_spm'] = round(cadence, 1)
 
@@ -562,26 +613,24 @@ class FrameProcessor:
         print(f"[Processor] === Stride L/R Calculation ===")
         print(f"[Processor] Step events count: {len(step_events)}, ppm: {ppm}")
 
-        # 최소 3개 이벤트만 있어도 계산 시도 (조건 완화)
+        # 같은 발 이벤트끼리 그룹핑 후 연속 쌍으로 stride 계산
         if len(step_events) >= 3:
             left_strides = []
             right_strides = []
             all_strides_debug = []
 
-            # 같은 발의 연속 스텝 간 거리 계산
-            for i in range(len(step_events) - 2):
-                curr = step_events[i]
-                # 2스텝 후 = 같은 발 (left -> right -> left)
-                next_same = step_events[i + 2]
-
-                if curr['leading_foot'] == next_same['leading_foot']:
+            for side in ['left', 'right']:
+                side_events = [e for e in step_events if e['leading_foot'] == side]
+                for i in range(1, len(side_events)):
+                    curr = side_events[i]
+                    prev = side_events[i - 1]
                     # leading_foot에 맞는 발의 좌표 사용
-                    if curr['leading_foot'] == 'left':
-                        x1, y1 = curr['left_x'], curr['left_y']
-                        x2, y2 = next_same['left_x'], next_same['left_y']
+                    if side == 'left':
+                        x1, y1 = prev['left_x'], prev['left_y']
+                        x2, y2 = curr['left_x'], curr['left_y']
                     else:
-                        x1, y1 = curr['right_x'], curr['right_y']
-                        x2, y2 = next_same['right_x'], next_same['right_y']
+                        x1, y1 = prev['right_x'], prev['right_y']
+                        x2, y2 = curr['right_x'], curr['right_y']
                     dx = abs(x2 - x1)
                     # Homography 원근 보정 적용
                     if self.perspective_corrector.calibrated:
@@ -590,20 +639,31 @@ class FrameProcessor:
                         stride_m = dx / ppm
 
                     all_strides_debug.append({
-                        'foot': curr['leading_foot'],
+                        'foot': side,
                         'dx_px': dx,
                         'stride_m': stride_m
                     })
 
-                    # 범위 완화: 0.3m ~ 4.0m
+                    # 범위: 0.3m ~ 4.0m
                     if 0.3 <= stride_m <= 4.0:
-                        if curr['leading_foot'] == 'left':
+                        if side == 'left':
                             left_strides.append(stride_m)
                         else:
                             right_strides.append(stride_m)
 
             print(f"[Processor] All strides (debug): {all_strides_debug[:5]}")  # 처음 5개만
-            print(f"[Processor] Valid strides - L: {len(left_strides)}, R: {len(right_strides)}")
+            print(f"[Processor] Valid strides (raw) - L: {len(left_strides)}, R: {len(right_strides)}")
+
+            # 이상치 제거 (median 기반: 0.5*median ~ 2.0*median 범위만 유지)
+            def filter_outliers(values):
+                if len(values) < 3:
+                    return values
+                med = np.median(values)
+                return [v for v in values if 0.5 * med <= v <= 2.0 * med]
+
+            left_strides = filter_outliers(left_strides)
+            right_strides = filter_outliers(right_strides)
+            print(f"[Processor] Valid strides (filtered) - L: {len(left_strides)}, R: {len(right_strides)}")
 
             if left_strides:
                 result['left_stride_length_m'] = round(np.mean(left_strides), 3)
@@ -685,7 +745,15 @@ class FrameProcessor:
                         else:
                             right_step_dists.append(step_m)
 
-            print(f"[Processor] Step L/R - L: {len(left_step_dists)} samples, R: {len(right_step_dists)} samples")
+            print(f"[Processor] Step L/R (raw) - L: {len(left_step_dists)} samples, R: {len(right_step_dists)} samples")
+
+            # 이상치 제거 (L/R 합쳐서 median 기준)
+            all_step_dists = left_step_dists + right_step_dists
+            if len(all_step_dists) >= 3:
+                step_med = np.median(all_step_dists)
+                left_step_dists = [v for v in left_step_dists if 0.5 * step_med <= v <= 2.0 * step_med]
+                right_step_dists = [v for v in right_step_dists if 0.5 * step_med <= v <= 2.0 * step_med]
+            print(f"[Processor] Step L/R (filtered) - L: {len(left_step_dists)} samples, R: {len(right_step_dists)} samples")
 
             if left_step_dists and right_step_dists:
                 left_len = np.mean(left_step_dists)
@@ -747,90 +815,39 @@ class FrameProcessor:
                     si_values.append(si)
                 print(f"[Processor] Stride Time L: {result['left_stride_time_s']}s, R: {result['right_stride_time_s']}s, SI: {si}%")
 
-        # ═══ IC/TO 이벤트 기반 스윙/스탠스 분석 (통합 임계값) ═══
-        print(f"[Processor] === Starting IC/TO Event-Based Swing/Stance Analysis ===", flush=True)
+        # ═══ 발목 X속도 기반 스윙/스탠스 분석 ═══
+        # 측면 카메라에서 가장 확실한 swing/stance 구분 = 발의 X방향 이동 속도
+        # Stance: 발이 바닥에 고정 → ankle_vx ≈ 0
+        # Swing: 발이 앞으로 이동 → |ankle_vx| 크게 증가
+        print(f"[Processor] === Starting Ankle X-Velocity Swing/Stance Analysis ===", flush=True)
         try:
             frame_time = 1.0 / self.fps if self.fps > 0 else 1/30
 
-            # toe(foot_index) Y좌표 추출 - 스윙 감지에 ankle보다 효과적
-            left_toe_y = np.array([h.get('left_toe_y', h['left_y']) for h in segment])
-            right_toe_y = np.array([h.get('right_toe_y', h['right_y']) for h in segment])
-            left_heel_y = np.array([h.get('left_heel_y', h['left_y']) for h in segment])
-            right_heel_y = np.array([h.get('right_heel_y', h['right_y']) for h in segment])
-
-            # 스무딩
-            if len(left_toe_y) > 5:
-                left_toe_y_smooth = np.convolve(left_toe_y, kernel, mode='same')
-                right_toe_y_smooth = np.convolve(right_toe_y, kernel, mode='same')
-                left_heel_y_smooth = np.convolve(left_heel_y, kernel, mode='same')
-                right_heel_y_smooth = np.convolve(right_heel_y, kernel, mode='same')
-            else:
-                left_toe_y_smooth = left_toe_y
-                right_toe_y_smooth = right_toe_y
-                left_heel_y_smooth = left_heel_y
-                right_heel_y_smooth = right_heel_y
-
-            # 발 속도 계산 (X축 속도)
+            # 각 발의 X 속도 계산
             left_vx = np.gradient(left_x_smooth, times)
             right_vx = np.gradient(right_x_smooth, times)
 
-            # ── 통합 임계값 계산 (좌우 동일하게 적용) ──
-            all_vx = np.concatenate([left_vx, right_vx])
-            min_step_frames = max(3, int(self.fps * 0.25))
+            # 보행 방향 부호 결정 (좌→우: +, 우→좌: -)
+            walk_dir = np.sign(np.mean(left_vx) + np.mean(right_vx))
+            if walk_dir == 0:
+                walk_dir = 1.0  # 기본값
 
-            # ── 통합 지면 기준 Y좌표 계산 ──
-            all_toe_y = np.concatenate([left_toe_y_smooth, right_toe_y_smooth])
-            all_heel_y = np.concatenate([left_heel_y_smooth, right_heel_y_smooth])
-            # 지면 Y = heel/toe의 상위 값 (화면에서 아래쪽 = Y 큰 값이 지면)
-            ground_y = np.percentile(all_heel_y, 80)
-            # 마진: 발이 지면에서 얼마나 떠야 swing인지 (Y가 ground_y보다 작으면 떠있음)
-            swing_margin_px = max(10, (np.max(all_heel_y) - np.min(all_heel_y)) * 0.15)
+            # Swing 판별: 발이 보행 방향으로 빠르게 이동할 때
+            # 전체 속도의 중앙값을 기준으로 threshold 계산
+            # median(|vx|)은 stance + swing 혼합 → 1.2배로 설정해야 ~38-42% swing 달성
+            all_vx = np.abs(np.concatenate([left_vx, right_vx]))
+            vx_threshold = np.median(all_vx) * 1.2
 
-            print(f"[Processor] Ground Y: {ground_y:.1f}, swing margin: {swing_margin_px:.1f}px", flush=True)
+            left_is_swing = (left_vx * walk_dir) > vx_threshold
+            right_is_swing = (right_vx * walk_dir) > vx_threshold
 
-            # ── IC/TO 이벤트 검출 함수 (개선 v3 - 지면 접촉 기반) ──
-            def detect_gait_events_v2(heel_y, toe_y, ankle_vx, ground_y, vel_threshold, timestamps):
-                """Stance/Swing 판별 - 지면 접촉 기반"""
-                events = []
-
-                # 각 프레임의 stance/swing 상태 판별
-                # Stance = 발이 지면에 닿아있음 (heel이 ground 근처)
-                # Swing = 발이 지면에서 떨어짐 (heel이 ground보다 위쪽 = Y값 작음)
-                is_stance_arr = []
-                for i in range(len(timestamps)):
-                    # heel이 지면 근처에 있으면 stance
-                    heel_on_ground = heel_y[i] >= ground_y - swing_margin_px
-                    is_stance_arr.append(heel_on_ground)
-
-                is_stance_arr = np.array(is_stance_arr)
-
-                # 상태 변화 감지
-                for i in range(1, len(is_stance_arr)):
-                    if is_stance_arr[i] and not is_stance_arr[i-1]:
-                        # Swing -> Stance = Initial Contact (착지)
-                        events.append({'type': 'IC', 'time': timestamps[i], 'frame': i})
-                    elif not is_stance_arr[i] and is_stance_arr[i-1]:
-                        # Stance -> Swing = Toe Off (발 떼기)
-                        events.append({'type': 'TO', 'time': timestamps[i], 'frame': i})
-
-                # stance/swing 프레임 수 계산
-                stance_frames = np.sum(is_stance_arr)
-                swing_frames = len(is_stance_arr) - stance_frames
-
-                return events, stance_frames, swing_frames
-
-            # 양발 각각 이벤트 검출
-            left_events, left_stance_frames, left_swing_frames = detect_gait_events_v2(
-                left_heel_y_smooth, left_toe_y_smooth, left_vx,
-                ground_y, 0, times
-            )
-            right_events, right_stance_frames, right_swing_frames = detect_gait_events_v2(
-                right_heel_y_smooth, right_toe_y_smooth, right_vx,
-                ground_y, 0, times
-            )
+            left_swing_frames = int(np.sum(left_is_swing))
+            left_stance_frames = len(left_is_swing) - left_swing_frames
+            right_swing_frames = int(np.sum(right_is_swing))
+            right_stance_frames = len(right_is_swing) - right_swing_frames
 
             total_frames = len(times)
-            print(f"[Processor] Events - L: {len(left_events)}, R: {len(right_events)}", flush=True)
+            print(f"[Processor] Walk direction: {'L→R' if walk_dir > 0 else 'R→L'}, vx_threshold: {vx_threshold:.1f}", flush=True)
             print(f"[Processor] Frames - L stance:{left_stance_frames} swing:{left_swing_frames}, R stance:{right_stance_frames} swing:{right_swing_frames}", flush=True)
 
             # ── Swing % / Stance % 계산 (백분율) ──
