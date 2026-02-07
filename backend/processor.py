@@ -24,6 +24,7 @@ from analyzer.gait_analyzer import GaitAnalyzer
 from analyzer.gait_judgment import judge_all
 from analyzer.calibration import DistanceCalibrator
 from analyzer.filter import KalmanFilter2D
+from analyzer.solution_2_homography import PerspectiveCorrector
 from utils.video_utils import VideoReader
 
 
@@ -59,6 +60,10 @@ class FrameProcessor:
         self.calibrator = DistanceCalibrator()
         self.gait_analyzer: Optional[GaitAnalyzer] = None
 
+        # 원근 보정 (#2 Homography)
+        self.perspective_corrector = PerspectiveCorrector()
+        self._first_frame: Optional[np.ndarray] = None
+
         # 상태
         self.prev_progress: Optional[float] = None
         self.timer_state = 'standby'  # standby | running | finished
@@ -88,6 +93,8 @@ class FrameProcessor:
         self.crossing_events = []
         self.ankle_history = []
         self._debug_frame_count = 0
+        self.perspective_corrector = PerspectiveCorrector()
+        self._first_frame = None
         # 보행 방향 초기화
         if hasattr(self.aruco, '_walking_direction'):
             self.aruco._walking_direction = None
@@ -120,6 +127,10 @@ class FrameProcessor:
             'results': None,
         }
 
+        # 첫 프레임 저장 (원근 보정용)
+        if self._first_frame is None:
+            self._first_frame = frame.copy()
+
         # 1) ArUco 마커 감지 (보정 완료 후에는 매 30프레임만 - 성능 최적화)
         run_aruco = (not self.aruco.calibrated) or (frame_idx % 30 == 0)
         if run_aruco:
@@ -136,6 +147,18 @@ class FrameProcessor:
             if self.aruco.try_calibrate():
                 result['calibration'] = self.aruco.get_calibration_info()
                 print(f"[Processor] Calibration done at frame {frame_idx} ({timestamp_s:.2f}s)")
+                # 원근 보정기 캘리브레이션 (#2 Homography)
+                if self._first_frame is not None:
+                    marker_info = {}
+                    sc = self.aruco.start_center_px
+                    fc = self.aruco.finish_center_px
+                    if sc and fc:
+                        marker_info[0] = {'cx': sc[0], 'cy': sc[1], 'size': 20}
+                        marker_info[1] = {'cx': fc[0], 'cy': fc[1], 'size': 20}
+                        self.perspective_corrector.calibrate(
+                            self._first_frame, marker_info,
+                            actual_distance_m=self.aruco.marker_distance_m
+                        )
 
         # 3) MediaPipe Pose 감지 (단일 사람)
         pose_result = self.pose_detector.detect(frame)
@@ -460,6 +483,8 @@ class FrameProcessor:
                         'leading_foot': 'left',
                         'left_x': float(left_x[idx]),
                         'right_x': float(right_x[idx]),
+                        'left_y': float(left_y[idx]),
+                        'right_y': float(right_y[idx]),
                     })
             for idx in right_hs:
                 if idx < len(times):
@@ -469,6 +494,8 @@ class FrameProcessor:
                         'leading_foot': 'right',
                         'left_x': float(left_x[idx]),
                         'right_x': float(right_x[idx]),
+                        'left_y': float(left_y[idx]),
+                        'right_y': float(right_y[idx]),
                     })
 
             all_hs.sort(key=lambda e: e['time'])
@@ -497,6 +524,8 @@ class FrameProcessor:
                             'leading_foot': leading_foot,
                             'left_x': float(left_x[idx]),
                             'right_x': float(right_x[idx]),
+                            'left_y': float(left_y[idx]),
+                            'right_y': float(right_y[idx]),
                         })
             print(f"[Processor] X-crossing fallback: {len(step_events)} steps", flush=True)
 
@@ -511,6 +540,7 @@ class FrameProcessor:
         # ═══ 기본 보행 지표 계산 ═══
         distance_m = self.aruco.marker_distance_m
         ppm = self.aruco.pixels_per_meter if self.aruco.pixels_per_meter else 100
+        print(f"[Processor] Homography calibrated: {self.perspective_corrector.calibrated}", flush=True)
 
         # 케이던스 (steps per minute)
         cadence = (step_count / elapsed) * 60
@@ -545,13 +575,19 @@ class FrameProcessor:
                 next_same = step_events[i + 2]
 
                 if curr['leading_foot'] == next_same['leading_foot']:
-                    # X좌표 차이 (픽셀) -> 미터 변환
-                    # leading_foot에 맞는 발의 X 좌표 사용
+                    # leading_foot에 맞는 발의 좌표 사용
                     if curr['leading_foot'] == 'left':
-                        dx = abs(next_same['left_x'] - curr['left_x'])
+                        x1, y1 = curr['left_x'], curr['left_y']
+                        x2, y2 = next_same['left_x'], next_same['left_y']
                     else:
-                        dx = abs(next_same['right_x'] - curr['right_x'])
-                    stride_m = dx / ppm
+                        x1, y1 = curr['right_x'], curr['right_y']
+                        x2, y2 = next_same['right_x'], next_same['right_y']
+                    dx = abs(x2 - x1)
+                    # Homography 원근 보정 적용
+                    if self.perspective_corrector.calibrated:
+                        stride_m = self.perspective_corrector.real_distance_x(x1, y1, x2, y2)
+                    else:
+                        stride_m = dx / ppm
 
                     all_strides_debug.append({
                         'foot': curr['leading_foot'],
@@ -631,11 +667,18 @@ class FrameProcessor:
                 prev = step_events[i - 1]
                 # 연속된 두 이벤트는 다른 발이어야 step
                 if curr['leading_foot'] != prev['leading_foot']:
-                    # 두 발의 중점(midpoint) X 변화로 step 거리 계산
+                    # 두 발의 중점(midpoint) 변화로 step 거리 계산
                     curr_mid_x = (curr['left_x'] + curr['right_x']) / 2
                     prev_mid_x = (prev['left_x'] + prev['right_x']) / 2
+                    curr_mid_y = (curr['left_y'] + curr['right_y']) / 2
+                    prev_mid_y = (prev['left_y'] + prev['right_y']) / 2
                     dx = abs(curr_mid_x - prev_mid_x)
-                    step_m = dx / ppm
+                    # Homography 원근 보정 적용
+                    if self.perspective_corrector.calibrated:
+                        step_m = self.perspective_corrector.real_distance_x(
+                            prev_mid_x, prev_mid_y, curr_mid_x, curr_mid_y)
+                    else:
+                        step_m = dx / ppm
                     if 0.2 <= step_m <= 2.0:  # 합리적 범위
                         if curr['leading_foot'] == 'left':
                             left_step_dists.append(step_m)
