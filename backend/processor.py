@@ -423,8 +423,8 @@ class FrameProcessor:
             left_heel_x_sm, left_heel_y_sm = left_heel_x_raw, left_heel_y_raw
             right_heel_x_sm, right_heel_y_sm = right_heel_x_raw, right_heel_y_raw
 
-        def detect_heel_strikes(heel_x_smooth, heel_y_smooth, times_arr, min_dist, min_gap_s=0.35):
-            """적응형 3중 필터 Heel Strike 감지
+        def detect_heel_strikes(heel_x_smooth, heel_y_smooth, times_arr, min_dist, min_gap_s=0.25):
+            """적응형 Heel Strike 감지 - 고감도 모드
 
             Args:
                 heel_x_smooth: 스무딩된 발꿈치 X좌표 배열
@@ -440,41 +440,45 @@ class FrameProcessor:
                 return []
 
             # ── 필터 1: heel Y 로컬 최대값 (화면 좌표: Y↑ = 아래 = 바닥) ──
-            # 측면 카메라에서 heel Y 변화 작음 (10~30px) → prominence 낮게 설정
+            # 측면 카메라에서 heel Y 변화 작음 (10~30px) → prominence 매우 낮게
             y_range = np.max(heel_y_smooth) - np.min(heel_y_smooth)
-            prom = max(2, y_range * 0.08)
-            peaks, _ = signal.find_peaks(heel_y_smooth, distance=min_dist, prominence=prom)
 
-            # 피크 부족 시 prominence 더 낮춰서 재시도
-            if len(peaks) < 3:
-                prom_retry = max(1, y_range * 0.04)
-                peaks, _ = signal.find_peaks(heel_y_smooth, distance=min_dist, prominence=prom_retry)
+            # 3단계 prominence 시도: 높은 것부터 낮은 것까지
+            for prom_factor in [0.06, 0.03, 0.015]:
+                prom = max(1, y_range * prom_factor)
+                peaks, props = signal.find_peaks(heel_y_smooth,
+                                                  distance=min_dist,
+                                                  prominence=prom)
+                if len(peaks) >= 4:
+                    break
 
             if len(peaks) == 0:
                 return []
 
-            # ── 필터 2: heel X 속도 필터 (접지 시 수평 이동 ≈ 0) ──
+            # ── 필터 2: heel X 속도 필터 (접지 시 수평 이동 느림) ──
             heel_vx = np.gradient(heel_x_smooth, times_arr)
             abs_heel_vx = np.abs(heel_vx)
             vx_median = np.median(abs_heel_vx)
-            vx_threshold = vx_median * 2.5  # 중앙값의 2.5배 이하만 유지 (완화)
 
-            filtered_peaks = []
-            for idx in peaks:
-                if abs_heel_vx[idx] <= vx_threshold:
-                    filtered_peaks.append(idx)
+            # 다단계 threshold: 엄격 → 완화
+            for vx_mult in [2.5, 4.0, 6.0]:
+                vx_threshold = vx_median * vx_mult
+                filtered_peaks = [idx for idx in peaks
+                                  if abs_heel_vx[idx] <= vx_threshold]
+                if len(filtered_peaks) >= 4:
+                    break
+            else:
+                filtered_peaks = list(peaks)  # 모든 필터 실패 시 전부 유지
 
-            # 필터 2에서 너무 많이 제거되면 완화
-            if len(filtered_peaks) < 3 and len(peaks) >= 3:
-                vx_threshold_relaxed = vx_median * 4.0
-                filtered_peaks = [idx for idx in peaks if abs_heel_vx[idx] <= vx_threshold_relaxed]
-
-            # ── 필터 3: 최소 시간 간격 (0.35초) ──
+            # ── 필터 3: 최소 시간 간격 ──
             final_peaks = []
             for idx in filtered_peaks:
                 if final_peaks:
                     dt = times_arr[idx] - times_arr[final_peaks[-1]]
                     if dt < min_gap_s:
+                        # 더 높은 Y(바닥에 가까운)를 유지
+                        if heel_y_smooth[idx] > heel_y_smooth[final_peaks[-1]]:
+                            final_peaks[-1] = idx
                         continue
                 final_peaks.append(idx)
 
@@ -514,24 +518,43 @@ class FrameProcessor:
 
             all_hs.sort(key=lambda e: e['time'])
 
-            # ── 양발 병합 후 bilateral 최소 간격 필터 (0.2s) ──
+            # ── 양발 병합 후 근접 이벤트 정리 ──
+            # dt < 0.15s: 같은 보행 이벤트 중복 → heel Y 큰 쪽만 유지
+            # 0.15s <= dt < 0.25s: 같은 발이면 중복 제거, 다른 발이면 유지
             deduped = []
             for ev in all_hs:
-                if deduped and (ev['time'] - deduped[-1]['time']) < 0.2:
-                    # 0.2초 이내 동시 이벤트 → heel Y가 더 큰 쪽(지면 가까운) 유지
-                    if ev['leading_foot'] != deduped[-1]['leading_foot']:
-                        curr_y = ev['left_y'] if ev['leading_foot'] == 'left' else ev['right_y']
-                        prev_y = deduped[-1]['left_y'] if deduped[-1]['leading_foot'] == 'left' else deduped[-1]['right_y']
-                        if curr_y > prev_y:
-                            deduped[-1] = ev
+                if not deduped:
+                    deduped.append(ev)
+                    continue
+                dt = ev['time'] - deduped[-1]['time']
+                if dt < 0.15:
+                    # 매우 가까운 이벤트 → 무조건 하나만 (같은 보행 이벤트)
+                    curr_y = ev['left_y'] if ev['leading_foot'] == 'left' else ev['right_y']
+                    prev_y = deduped[-1]['left_y'] if deduped[-1]['leading_foot'] == 'left' else deduped[-1]['right_y']
+                    if curr_y > prev_y:
+                        deduped[-1] = ev
+                    continue
+                if dt < 0.25 and ev['leading_foot'] == deduped[-1]['leading_foot']:
+                    # 같은 발 근접 → 중복 제거
+                    curr_y = ev['left_y'] if ev['leading_foot'] == 'left' else ev['right_y']
+                    prev_y = deduped[-1]['left_y'] if deduped[-1]['leading_foot'] == 'left' else deduped[-1]['right_y']
+                    if curr_y > prev_y:
+                        deduped[-1] = ev
                     continue
                 deduped.append(ev)
             all_hs = deduped
 
-            # ── START 직후 진입 중 스텝 제외 ──
+            # ── START 직후 / FINISH 직전 경계 스텝 제외 ──
             step_buffer_s = 0.3
             all_hs = [e for e in all_hs if e['time'] >= start_t + step_buffer_s]
-            print(f"[Processor] After start buffer ({step_buffer_s}s): {len(all_hs)} heel strikes", flush=True)
+            # FINISH 직전 마지막 스텝: 이전 스텝과의 dt가 중앙값의 2.5배 이상이면 제거
+            if len(all_hs) >= 4:
+                dts = [all_hs[i]['time'] - all_hs[i-1]['time'] for i in range(1, len(all_hs))]
+                dt_median = float(np.median(dts))
+                if dts[-1] > dt_median * 2.5:
+                    all_hs = all_hs[:-1]
+                    print(f"[Processor] Removed last step (dt={dts[-1]:.3f}s >> median={dt_median:.3f}s)", flush=True)
+            print(f"[Processor] After dedup+buffer: {len(all_hs)} heel strikes", flush=True)
 
             step_events = all_hs
         except Exception as e:
@@ -572,6 +595,38 @@ class FrameProcessor:
                 step_events = fallback_events
             print(f"[Processor] X-crossing fallback: HS={hs_count} + fallback={len(fallback_events)} → merged={len(step_events)}", flush=True)
 
+        # ═══ Leading Foot 재판별: 공간 위치 기반 ═══
+        # 측면 카메라에서 HS 감지기의 L/R 라벨이 부정확한 문제 해결
+        # 원리: 각 HS 시점에서 보행 방향으로 더 앞에 있는 발 = leading foot
+        if len(step_events) >= 2:
+            # 보행 방향 부호 결정 (X 증가=+1, X 감소=-1)
+            first_mid = (step_events[0]['left_x'] + step_events[0]['right_x']) / 2
+            last_mid = (step_events[-1]['left_x'] + step_events[-1]['right_x']) / 2
+            walk_sign = 1.0 if last_mid > first_mid else -1.0
+
+            reassign_count = 0
+            for ev in step_events:
+                # 보행 방향으로 더 앞에 있는 발 = leading foot
+                left_ahead = ev['left_x'] * walk_sign
+                right_ahead = ev['right_x'] * walk_sign
+                new_foot = 'left' if left_ahead > right_ahead else 'right'
+                if ev['leading_foot'] != new_foot:
+                    reassign_count += 1
+                ev['leading_foot'] = new_foot
+
+            if reassign_count > 0:
+                print(f"[Processor] Spatial position reassign: {reassign_count}/{len(step_events)} events relabeled", flush=True)
+
+            # 교대 강제: 같은 발 연속이면 두 번째를 반대 발로 전환
+            opposite = {'left': 'right', 'right': 'left'}
+            flip_count = 0
+            for i in range(1, len(step_events)):
+                if step_events[i]['leading_foot'] == step_events[i-1]['leading_foot']:
+                    step_events[i]['leading_foot'] = opposite[step_events[i]['leading_foot']]
+                    flip_count += 1
+            if flip_count > 0:
+                print(f"[Processor] Alternation fix: flipped {flip_count} remaining consecutive same-foot", flush=True)
+
         step_count = len(step_events)
         result['step_events'] = step_events
         result['step_count'] = step_count
@@ -609,52 +664,38 @@ class FrameProcessor:
         if stride_length and 0.4 <= stride_length <= 2.5:
             result['stride_length_m'] = round(stride_length, 3)
 
-        # 좌우 활보장 개별 계산 (같은 발 연속 착지 간 거리)
+        # 좌우 활보장 개별 계산 (2-step 간격 = stride)
         print(f"[Processor] === Stride L/R Calculation ===")
         print(f"[Processor] Step events count: {len(step_events)}, ppm: {ppm}")
 
-        # 같은 발 이벤트끼리 그룹핑 후 연속 쌍으로 stride 계산
+        # 라벨 독립: event[i]→event[i+2] 거리 = stride (같은 발 1회전)
+        # 홀수 위치(0,2,4,..) = foot A stride, 짝수 위치(1,3,5,..) = foot B stride
         if len(step_events) >= 3:
             left_strides = []
             right_strides = []
-            all_strides_debug = []
 
-            for side in ['left', 'right']:
-                side_events = [e for e in step_events if e['leading_foot'] == side]
-                for i in range(1, len(side_events)):
-                    curr = side_events[i]
-                    prev = side_events[i - 1]
-                    # leading_foot에 맞는 발의 좌표 사용
-                    if side == 'left':
-                        x1, y1 = prev['left_x'], prev['left_y']
-                        x2, y2 = curr['left_x'], curr['left_y']
+            for i in range(len(step_events) - 2):
+                curr = step_events[i]
+                next2 = step_events[i + 2]
+                # 중점(midpoint)으로 stride 거리 계산
+                x1 = (curr['left_x'] + curr['right_x']) / 2
+                y1 = (curr['left_y'] + curr['right_y']) / 2
+                x2 = (next2['left_x'] + next2['right_x']) / 2
+                y2 = (next2['left_y'] + next2['right_y']) / 2
+                dx = abs(x2 - x1)
+                if self.perspective_corrector.calibrated:
+                    stride_m = self.perspective_corrector.real_distance_x(x1, y1, x2, y2)
+                else:
+                    stride_m = dx / ppm
+
+                if 0.3 <= stride_m <= 4.0:
+                    if i % 2 == 0:
+                        left_strides.append(stride_m)
                     else:
-                        x1, y1 = prev['right_x'], prev['right_y']
-                        x2, y2 = curr['right_x'], curr['right_y']
-                    dx = abs(x2 - x1)
-                    # Homography 원근 보정 적용
-                    if self.perspective_corrector.calibrated:
-                        stride_m = self.perspective_corrector.real_distance_x(x1, y1, x2, y2)
-                    else:
-                        stride_m = dx / ppm
+                        right_strides.append(stride_m)
 
-                    all_strides_debug.append({
-                        'foot': side,
-                        'dx_px': dx,
-                        'stride_m': stride_m
-                    })
+            print(f"[Processor] Valid strides - L: {len(left_strides)}, R: {len(right_strides)}")
 
-                    # 범위: 0.3m ~ 4.0m
-                    if 0.3 <= stride_m <= 4.0:
-                        if side == 'left':
-                            left_strides.append(stride_m)
-                        else:
-                            right_strides.append(stride_m)
-
-            print(f"[Processor] All strides (debug): {all_strides_debug[:5]}")  # 처음 5개만
-            print(f"[Processor] Valid strides (raw) - L: {len(left_strides)}, R: {len(right_strides)}")
-
-            # 이상치 제거 (median 기반: 0.5*median ~ 2.0*median 범위만 유지)
             def filter_outliers(values):
                 if len(values) < 3:
                     return values
@@ -717,29 +758,24 @@ class FrameProcessor:
 
             # 1) 좌우 보폭 (Step Length)
             # Step = 연속된 step event 간 거리 (다른 발 사이)
-            # left_step = '왼발이 앞서는 스텝'의 길이 = 이전 event → left leading event
-            # right_step = '오른발이 앞서는 스텝'의 길이 = 이전 event → right leading event
             left_step_dists = []
             right_step_dists = []
 
             for i in range(1, len(step_events)):
                 curr = step_events[i]
                 prev = step_events[i - 1]
-                # 연속된 두 이벤트는 다른 발이어야 step
                 if curr['leading_foot'] != prev['leading_foot']:
-                    # 두 발의 중점(midpoint) 변화로 step 거리 계산
                     curr_mid_x = (curr['left_x'] + curr['right_x']) / 2
                     prev_mid_x = (prev['left_x'] + prev['right_x']) / 2
                     curr_mid_y = (curr['left_y'] + curr['right_y']) / 2
                     prev_mid_y = (prev['left_y'] + prev['right_y']) / 2
                     dx = abs(curr_mid_x - prev_mid_x)
-                    # Homography 원근 보정 적용
                     if self.perspective_corrector.calibrated:
                         step_m = self.perspective_corrector.real_distance_x(
                             prev_mid_x, prev_mid_y, curr_mid_x, curr_mid_y)
                     else:
                         step_m = dx / ppm
-                    if 0.2 <= step_m <= 2.0:  # 합리적 범위
+                    if 0.2 <= step_m <= 2.0:
                         if curr['leading_foot'] == 'left':
                             left_step_dists.append(step_m)
                         else:
@@ -790,19 +826,16 @@ class FrameProcessor:
                 if si is not None:
                     si_values.append(si)
 
-            # 3) 좌우 활보장 시간 (Stride Time = 같은 발 연속, 같은 발)
-            def calc_stride_times(steps):
-                if len(steps) < 2:
-                    return []
-                times_list = []
-                for i in range(1, len(steps)):
-                    dt = steps[i]['time'] - steps[i-1]['time']
-                    if 0.4 <= dt <= 4.0:
-                        times_list.append(dt)
-                return times_list
-
-            left_stride_times = calc_stride_times(left_steps)
-            right_stride_times = calc_stride_times(right_steps)
+            # 3) 좌우 활보장 시간 (Stride Time = event[i]→event[i+2] 간격)
+            left_stride_times = []
+            right_stride_times = []
+            for i in range(len(step_events) - 2):
+                dt = step_events[i + 2]['time'] - step_events[i]['time']
+                if 0.4 <= dt <= 4.0:
+                    if i % 2 == 0:
+                        left_stride_times.append(dt)
+                    else:
+                        right_stride_times.append(dt)
 
             if left_stride_times and right_stride_times:
                 left_st = float(np.mean(left_stride_times))

@@ -302,6 +302,7 @@ async def _run_analysis(
     total_frames = reader.total_frames
 
     processor.aruco.set_camera_params(reader.width, reader.height)
+    processor.set_fps(fps)
 
     frame_skip = 3 if fps > 45 else 2  # 60fps → 20fps, 30fps → 15fps
     # Pass 1에서는 더 큰 간격으로 스캔 (마커만 찾으면 됨)
@@ -538,7 +539,7 @@ if __name__ == "__main__":
     print("  AR Gait Timer Backend (Lateral/Horizontal Analysis)")
     print("  - Mode: Left-Right Walking Analysis")
     print("  - Camera: Side view (camera perpendicular to walking path)")
-    print("  http://localhost:8001")
+    print("  http://localhost:8000")
     print("=" * 60)
     uvicorn.run(
         "server:app",
