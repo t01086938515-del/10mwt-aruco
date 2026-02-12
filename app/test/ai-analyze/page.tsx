@@ -85,19 +85,15 @@ export default function AIAnalyzePage() {
     }
   };
 
-  // 백엔드에서 보내는 crossing_event 형식: {line: 'start'|'finish', timestamp_s, ...}
-  const startEvent = crossingEvents.find((e: any) => e.line === "start" || e.type === "start");
-  const finishEvent = crossingEvents.find((e: any) => e.line === "finish" || e.type === "end");
+  const startEvent = crossingEvents.find((e) => e.line === "start");
+  const finishEvent = crossingEvents.find((e) => e.line === "finish");
 
   // 타이머 계산
   useEffect(() => {
     if (startEvent && finishEvent) {
-      const startTime = startEvent.timestamp_s ?? startEvent.timestamp ?? 0;
-      const finishTime = finishEvent.timestamp_s ?? finishEvent.timestamp ?? 0;
-      setElapsedTime(finishTime - startTime);
+      setElapsedTime(finishEvent.timestamp_s - startEvent.timestamp_s);
     } else if (startEvent && currentFrame?.timestamp_s) {
-      const startTime = startEvent.timestamp_s ?? startEvent.timestamp ?? 0;
-      setElapsedTime(currentFrame.timestamp_s - startTime);
+      setElapsedTime(currentFrame.timestamp_s - startEvent.timestamp_s);
     }
   }, [startEvent, finishEvent, currentFrame]);
 
@@ -248,13 +244,13 @@ export default function AIAnalyzePage() {
               <div className="rounded-lg bg-gray-100 p-3 text-center">
                 <p className="text-xs text-gray-500">현재 프레임</p>
                 <p className="text-xl font-bold">
-                  {currentFrame?.frame_number || "-"}
+                  {currentFrame?.frame_idx || "-"}
                 </p>
               </div>
               <div className="rounded-lg bg-gray-100 p-3 text-center">
                 <p className="text-xs text-gray-500">측정 구간 내</p>
                 <p className="text-xl font-bold">
-                  {currentFrame?.in_zone ? (
+                  {currentFrame?.timer?.state === "running" ? (
                     <span className="text-green-600">예</span>
                   ) : (
                     <span className="text-gray-400">아니오</span>
@@ -262,11 +258,9 @@ export default function AIAnalyzePage() {
                 </p>
               </div>
               <div className="rounded-lg bg-gray-100 p-3 text-center">
-                <p className="text-xs text-gray-500">중심 위치</p>
+                <p className="text-xs text-gray-500">감지 마커</p>
                 <p className="text-xl font-bold">
-                  {currentFrame?.center_x
-                    ? `${Math.round(currentFrame.center_x)}px`
-                    : "-"}
+                  {currentFrame?.num_markers ?? "-"}
                 </p>
               </div>
             </div>
@@ -280,7 +274,7 @@ export default function AIAnalyzePage() {
                     <div className="flex items-center justify-between rounded bg-green-50 px-3 py-2 text-sm">
                       <span className="text-green-700">시작선 통과</span>
                       <span className="font-mono text-green-600">
-                        {((startEvent as any).timestamp_s ?? (startEvent as any).timestamp ?? 0).toFixed(2)}s
+                        {startEvent.timestamp_s.toFixed(2)}s
                       </span>
                     </div>
                   )}
@@ -288,7 +282,7 @@ export default function AIAnalyzePage() {
                     <div className="flex items-center justify-between rounded bg-blue-50 px-3 py-2 text-sm">
                       <span className="text-blue-700">종료선 통과</span>
                       <span className="font-mono text-blue-600">
-                        {((finishEvent as any).timestamp_s ?? (finishEvent as any).timestamp ?? 0).toFixed(2)}s
+                        {finishEvent.timestamp_s.toFixed(2)}s
                       </span>
                     </div>
                   )}

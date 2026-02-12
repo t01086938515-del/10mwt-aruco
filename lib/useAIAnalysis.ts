@@ -57,12 +57,11 @@ export function useAIAnalysis() {
       ws.on("frame_data", (msg: WSMessage) => {
         const data = msg as unknown as FrameData & { type: string };
         dispatch(updateFrame(data));
-        // 진행률 업데이트 (임시로 frame_number 기반)
-        if (data.frame_number !== undefined) {
+        if (data.frame_idx !== undefined) {
           dispatch(
             updateProgress({
-              currentFrame: data.frame_number,
-              totalFrames: progress.totalFrames || data.frame_number + 100,
+              currentFrame: data.frame_idx,
+              totalFrames: progress.totalFrames || data.frame_idx + 100,
             })
           );
         }

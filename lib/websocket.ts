@@ -33,23 +33,21 @@ export interface KeypointData {
 }
 
 export interface FrameData {
-  frame_number: number;
   frame_idx: number;
-  timestamp: number;
   timestamp_s: number;
-  keypoints: KeypointData[];
-  ankle_left: { x: number; y: number } | null;
-  ankle_right: { x: number; y: number } | null;
-  center_x: number | null;
-  in_zone: boolean;
-  frame_image?: string;  // base64 JPEG 이미지
+  markers: any[];
+  num_markers: number;
+  timer: { state: string; elapsed_s: number };
+  crossing_event: 'start' | 'finish' | null;
+  calibration: { calibrated: boolean; [key: string]: any };
+  results: any | null;
+  frame_image?: string;
 }
 
 export interface CrossingEvent {
-  type: 'start' | 'end';
-  timestamp: number;
-  frame_number: number;
-  direction: 'left_to_right' | 'right_to_left';
+  line: 'start' | 'finish';
+  timestamp_s: number;
+  timer: { state: string; elapsed_s: number };
 }
 
 // 판정 결과 타입

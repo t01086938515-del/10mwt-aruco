@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { useAppSelector, useAppDispatch } from "@/store/hooks";
 import { useAIAnalysis } from "@/lib/useAIAnalysis";
@@ -56,13 +56,126 @@ const VARIABLE_GROUPS = [
   },
   {
     label: "시간 변수",
-    keys: ["step_time_s", "stride_time_s"],
+    keys: ["left_step_time_s", "right_step_time_s", "left_stride_time_s", "right_stride_time_s"],
   },
   {
     label: "비율 변수",
     keys: ["stance_ratio_pct", "swing_ratio_pct"],
   },
 ];
+
+// ═══ Clip overlay drawing utilities ═══
+function drawRoundedRect(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, w: number, h: number, r: number
+) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function drawGaugeBar(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, w: number, h: number,
+  value: number, min: number, max: number,
+  normalMin: number, normalMax: number,
+  color: string
+) {
+  const clamp01 = (v: number) => Math.min(1, Math.max(0, (v - min) / (max - min)));
+
+  // Track background
+  drawRoundedRect(ctx, x, y, w, h, h / 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Normal range highlight
+  const normStartPx = x + clamp01(normalMin) * w;
+  const normEndPx = x + clamp01(normalMax) * w;
+  ctx.fillStyle = 'rgba(34,197,94,0.25)';
+  ctx.fillRect(normStartPx, y, normEndPx - normStartPx, h);
+
+  // Normal range labels
+  ctx.font = `${Math.max(9, h * 0.7)}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(34,197,94,0.7)';
+  ctx.fillText(`${normalMin}`, normStartPx, y - 3);
+  ctx.fillText(`${normalMax}`, normEndPx, y - 3);
+
+  // Value marker
+  const markerX = x + clamp01(value) * w;
+  ctx.beginPath();
+  ctx.arc(markerX, y + h / 2, h * 0.75, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.strokeStyle = 'white';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+function drawJudgmentBanner(
+  ctx: CanvasRenderingContext2D,
+  cw: number,
+  j: JudgmentVariable | null,
+  title: string
+): number {
+  const bH = 40;
+  ctx.fillStyle = 'rgba(0,0,0,0.8)';
+  ctx.fillRect(0, 0, cw, bH);
+
+  const fontSize = Math.max(13, cw * 0.028);
+  ctx.font = `bold ${fontSize}px sans-serif`;
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'white';
+  ctx.fillText(title, 12, bH / 2 + fontSize * 0.35);
+
+  if (j) {
+    const statusColor = j.color === 'green' ? '#22c55e'
+      : j.color === 'orange' ? '#f97316' : '#9ca3af';
+    const statusText = j.status === '정상' ? 'NORMAL'
+      : j.status === 'N/A' ? 'N/A'
+      : `${j.direction || ''} ${j.deviation != null ? j.deviation.toFixed(0) + '%' : j.status}`;
+    ctx.textAlign = 'right';
+    ctx.fillStyle = statusColor;
+    ctx.font = `bold ${fontSize}px sans-serif`;
+    ctx.fillText(statusText, cw - 12, bH / 2 + fontSize * 0.35);
+  }
+  return bH;
+}
+
+function drawArrowLine(
+  ctx: CanvasRenderingContext2D,
+  fromX: number, fromY: number, toX: number, toY: number,
+  color: string, lineWidth: number = 3
+) {
+  const angle = Math.atan2(toY - fromY, toX - fromX);
+  const headLen = Math.max(10, lineWidth * 4);
+
+  ctx.beginPath();
+  ctx.moveTo(fromX, fromY);
+  ctx.lineTo(toX - headLen * 0.6 * Math.cos(angle), toY - headLen * 0.6 * Math.sin(angle));
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(toX, toY);
+  ctx.lineTo(toX - headLen * Math.cos(angle - Math.PI / 7), toY - headLen * Math.sin(angle - Math.PI / 7));
+  ctx.lineTo(toX - headLen * Math.cos(angle + Math.PI / 7), toY - headLen * Math.sin(angle + Math.PI / 7));
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+}
 
 export default function AIResultPage() {
   const router = useRouter();
@@ -77,7 +190,8 @@ export default function AIResultPage() {
     endS: number;
     variableName: string;
     foot: 'left' | 'right' | null;
-  }>({ open: false, label: "", startS: 0, endS: 0, variableName: "", foot: null });
+    judgment: JudgmentVariable | null;
+  }>({ open: false, label: "", startS: 0, endS: 0, variableName: "", foot: null, judgment: null });
   const videoRef = useRef<HTMLVideoElement>(null);
   const clipCanvasRef = useRef<HTMLCanvasElement>(null);
   const clipAnimRef = useRef<number>(0);
@@ -97,17 +211,32 @@ export default function AIResultPage() {
   const evidenceClips: Record<string, { start_s: number; end_s: number; label: string }> =
     (result as any)?.results?.evidence_clips || {};
 
+  // Pre-compute variable judgment map for clip overlays
+  const varMap = useMemo(() => {
+    const map = new Map<string, JudgmentVariable>();
+    const j = (metrics as any)?.judgment as GaitJudgment | undefined;
+    if (j?.variables) {
+      for (const v of j.variables) {
+        map.set(v.variable_name, v);
+      }
+    }
+    return map;
+  }, [metrics]);
+
   const openClip = useCallback((variableName: string) => {
     const clip = evidenceClips[variableName];
     if (!clip) return;
     const foot = variableName.startsWith('left_') ? 'left' as const
       : variableName.startsWith('right_') ? 'right' as const : null;
+    // L/R 변수는 base 변수명의 judgment를 사용 (e.g., left_step_time_s → step_time_s)
+    const baseVarName = variableName.replace(/^(left|right)_/, '');
     setClipModal({
       open: true, label: clip.label,
       startS: clip.start_s, endS: clip.end_s,
       variableName, foot,
+      judgment: varMap.get(variableName) || varMap.get(baseVarName) || null,
     });
-  }, [evidenceClips]);
+  }, [evidenceClips, varMap]);
 
   // Timeline data from analysis results
   const metricsData = (result as any)?.results as GaitMetrics | undefined;
@@ -313,7 +442,7 @@ export default function AIResultPage() {
     setPlaybackRate(rate);
   }, []);
 
-  // ═══ Clip Modal: Canvas overlay for step visualization ═══
+  // ═══ Clip Modal: Variable-specific canvas overlay ═══
   const renderClipOverlay = useCallback(() => {
     const video = videoRef.current;
     const canvas = clipCanvasRef.current;
@@ -330,207 +459,711 @@ export default function AIResultPage() {
     }
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    const scaleX = canvas.width / (video.videoWidth || 1);
-    const scaleY = canvas.height / (video.videoHeight || 1);
+    const cw = canvas.width;
+    const ch = canvas.height;
+    const scaleX = cw / (video.videoWidth || 1);
+    const scaleY = ch / (video.videoHeight || 1);
 
     const entry = getTimelineEntry(currentTime);
     if (!entry) return;
 
-    const isStepVar = clipModal.variableName.includes('step_length') || clipModal.variableName.includes('stride_length');
+    const varName = clipModal.variableName;
+    const jv = clipModal.judgment;
     const foot = clipModal.foot;
 
-    // Find the step event closest to this clip's time range
-    const clipSteps = stepEventsAll.filter(
-      (s) => s.time >= clipModal.startS - 0.2 && s.time <= clipModal.endS + 0.2
-    );
-    // Find the specific step event for the foot
-    const targetStep = foot
-      ? clipSteps.find(s => s.leading_foot === foot) || clipSteps[0]
-      : clipSteps[Math.floor(clipSteps.length / 2)];
+    // Determine variable category
+    const isVelocity = varName === 'gait_velocity_ms';
+    const isCadence = varName === 'cadence_spm';
+    const isDistance = varName.includes('step_length') || varName.includes('stride_length');
+    const isTime = varName.includes('time_s');
+    const isRatio = varName.includes('swing') || varName.includes('stance');
 
-    // ── Draw ankle positions (always) ──
-    // Left ankle (blue)
-    ctx.beginPath();
-    ctx.arc(entry.lx * scaleX, entry.ly * scaleY, 8, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(59, 130, 246, 0.9)';
-    ctx.fill();
-    ctx.strokeStyle = 'white';
-    ctx.lineWidth = 2.5;
-    ctx.stroke();
+    // Common: draw ankle dots
+    const drawAnkles = () => {
+      ctx.beginPath();
+      ctx.arc(entry.lx * scaleX, entry.ly * scaleY, 7, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(59, 130, 246, 0.9)';
+      ctx.fill();
+      ctx.strokeStyle = 'white';
+      ctx.lineWidth = 2;
+      ctx.stroke();
 
-    // Right ankle (red)
-    ctx.beginPath();
-    ctx.arc(entry.rx * scaleX, entry.ry * scaleY, 8, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(239, 68, 68, 0.9)';
-    ctx.fill();
-    ctx.strokeStyle = 'white';
-    ctx.lineWidth = 2.5;
-    ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(entry.rx * scaleX, entry.ry * scaleY, 7, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(239, 68, 68, 0.9)';
+      ctx.fill();
+      ctx.strokeStyle = 'white';
+      ctx.lineWidth = 2;
+      ctx.stroke();
 
-    // Foot labels
-    const labelSize = Math.max(11, canvas.width * 0.02);
-    ctx.font = `bold ${labelSize}px sans-serif`;
-    ctx.textAlign = 'center';
-    ctx.fillStyle = '#3b82f6';
-    ctx.fillText('L', entry.lx * scaleX, entry.ly * scaleY - 14);
-    ctx.fillStyle = '#ef4444';
-    ctx.fillText('R', entry.rx * scaleX, entry.ry * scaleY - 14);
+      const ls = Math.max(10, cw * 0.018);
+      ctx.font = `bold ${ls}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#93c5fd';
+      ctx.fillText('L', entry.lx * scaleX, entry.ly * scaleY - 12);
+      ctx.fillStyle = '#fca5a5';
+      ctx.fillText('R', entry.rx * scaleX, entry.ry * scaleY - 12);
+    };
 
-    // ── Step/Stride length visualization ──
-    if (isStepVar && targetStep) {
-      const stepTime = targetStep.time;
-      // Find previous step event (the stance foot position at start of this step)
-      const stepIdx = stepEventsAll.indexOf(targetStep);
-      const prevStep = stepIdx > 0 ? stepEventsAll[stepIdx - 1] : null;
+    // ═══ VELOCITY ═══
+    if (isVelocity) {
+      drawJudgmentBanner(ctx, cw, jv, '보행 속도');
+      drawAnkles();
 
-      if (prevStep) {
-        // Anchor point = stance foot position (previous step's leading foot position)
-        const anchorFoot = prevStep.leading_foot;
-        const anchorX = anchorFoot === 'left'
-          ? prevStep.left_x * scaleX
-          : prevStep.right_x * scaleX;
-        const anchorY = (prevStep.peak_y || entry.ly) * scaleY;
+      const spd = entry.spd;
+      let perryLabel = '';
+      let perryColor = '#22c55e';
+      if (spd < 0.4) { perryLabel = 'Household Amb.'; perryColor = '#ef4444'; }
+      else if (spd < 0.6) { perryLabel = 'Limited Community'; perryColor = '#f97316'; }
+      else if (spd < 0.8) { perryLabel = 'Community Amb.'; perryColor = '#eab308'; }
+      else if (spd < 1.0) { perryLabel = 'Full Community'; perryColor = '#22c55e'; }
+      else if (spd < 1.4) { perryLabel = 'Normal Speed'; perryColor = '#22c55e'; }
+      else { perryLabel = 'Fast Walker'; perryColor = '#3b82f6'; }
 
-        // Target point = leading foot's current position (animates over time)
-        const leadingFoot = targetStep.leading_foot;
-        const targetX = leadingFoot === 'left'
-          ? targetStep.left_x * scaleX
-          : targetStep.right_x * scaleX;
+      // Big speed number
+      const bigFs = Math.max(48, cw * 0.12);
+      ctx.font = `bold ${bigFs}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillText(spd.toFixed(2), cw / 2 + 2, ch * 0.42 + 2);
+      ctx.fillStyle = 'white';
+      ctx.fillText(spd.toFixed(2), cw / 2, ch * 0.42);
 
-        // Current leading foot position (from timeline entry)
-        const currentX = leadingFoot === 'left'
-          ? entry.lx * scaleX
-          : entry.rx * scaleX;
-        const currentY = leadingFoot === 'left'
-          ? entry.ly * scaleY
-          : entry.ry * scaleY;
+      // Unit
+      ctx.font = `${Math.max(16, cw * 0.035)}px sans-serif`;
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.fillText('m/s', cw / 2, ch * 0.42 + bigFs * 0.4);
 
-        // Progress: how far through the step are we?
-        const stepDuration = stepTime - prevStep.time;
-        const elapsed = currentTime - prevStep.time;
-        const progress = Math.min(1, Math.max(0, stepDuration > 0 ? elapsed / stepDuration : 0));
+      // Perry badge
+      const badgeFs = Math.max(14, cw * 0.03);
+      ctx.font = `bold ${badgeFs}px sans-serif`;
+      const badgeW = ctx.measureText(perryLabel).width + 24;
+      const badgeH = badgeFs + 14;
+      const badgeX = (cw - badgeW) / 2;
+      const badgeY = ch * 0.48;
+      drawRoundedRect(ctx, badgeX, badgeY, badgeW, badgeH, badgeH / 2);
+      ctx.fillStyle = perryColor;
+      ctx.fill();
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'white';
+      ctx.fillText(perryLabel, cw / 2, badgeY + badgeH / 2 + badgeFs * 0.35);
 
-        // Animated endpoint: lerp from anchor to current foot position
-        const lineEndX = currentX;
-        const lineEndY = currentY;
+      // Gauge bar
+      const gY = ch * 0.62;
+      const gW = cw * 0.75;
+      const gX = (cw - gW) / 2;
+      drawGaugeBar(ctx, gX, gY, gW, 14, spd, 0, 2.0, 1.0, 1.4, perryColor);
 
-        // ── Growing measurement line ──
-        // Thick colored line from anchor to current foot
-        const lineColor = leadingFoot === 'left' ? '#3b82f6' : '#ef4444';
-        const lineColorBg = leadingFoot === 'left' ? 'rgba(59,130,246,0.15)' : 'rgba(239,68,68,0.15)';
+      ctx.font = `${Math.max(10, cw * 0.02)}px sans-serif`;
+      ctx.textAlign = 'left';
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.fillText('0', gX, gY + 28);
+      ctx.textAlign = 'right';
+      ctx.fillText('2.0 m/s', gX + gW, gY + 28);
 
-        // Background glow
+      // Elapsed time
+      const elapsed = currentTime - timelineMeta.start_t;
+      ctx.font = `bold ${Math.max(12, cw * 0.025)}px sans-serif`;
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#fbbf24';
+      ctx.fillText(`${elapsed > 0 ? elapsed.toFixed(1) : '0.0'}s`, cw - 12, ch - 12);
+    }
+
+    // ═══ CADENCE ═══
+    else if (isCadence) {
+      drawJudgmentBanner(ctx, cw, jv, '케이던스');
+      drawAnkles();
+
+      const cad = entry.cad;
+
+      // Big cadence number
+      const bigFs = Math.max(48, cw * 0.12);
+      ctx.font = `bold ${bigFs}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillText(cad.toFixed(0), cw / 2 + 2, ch * 0.42 + 2);
+      ctx.fillStyle = '#a78bfa';
+      ctx.fillText(cad.toFixed(0), cw / 2, ch * 0.42);
+
+      ctx.font = `${Math.max(16, cw * 0.035)}px sans-serif`;
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.fillText('steps/min', cw / 2, ch * 0.42 + bigFs * 0.4);
+
+      // Gauge
+      const gY = ch * 0.55;
+      const gW = cw * 0.75;
+      const gX = (cw - gW) / 2;
+      drawGaugeBar(ctx, gX, gY, gW, 14, cad, 40, 160, 100, 120, '#a78bfa');
+
+      ctx.font = `${Math.max(10, cw * 0.02)}px sans-serif`;
+      ctx.textAlign = 'left';
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.fillText('40', gX, gY + 28);
+      ctx.textAlign = 'right';
+      ctx.fillText('160 spm', gX + gW, gY + 28);
+
+      // Step rhythm dots (bottom)
+      const dotY = ch * 0.75;
+      const dotW = cw * 0.85;
+      const dotX = (cw - dotW) / 2;
+      const clipDur = clipModal.endS - clipModal.startS;
+
+      ctx.fillStyle = 'rgba(255,255,255,0.1)';
+      ctx.fillRect(dotX, dotY - 1.5, dotW, 3);
+
+      const clipSteps = stepEventsAll.filter(
+        s => s.time >= clipModal.startS - 0.1 && s.time <= clipModal.endS + 0.1
+      );
+      clipSteps.forEach(step => {
+        const t = (step.time - clipModal.startS) / clipDur;
+        const sx = dotX + t * dotW;
         ctx.beginPath();
-        ctx.moveTo(anchorX, anchorY);
-        ctx.lineTo(lineEndX, lineEndY);
-        ctx.strokeStyle = lineColorBg;
-        ctx.lineWidth = 20;
-        ctx.stroke();
-
-        // Main line
-        ctx.beginPath();
-        ctx.moveTo(anchorX, anchorY);
-        ctx.lineTo(lineEndX, lineEndY);
-        ctx.strokeStyle = lineColor;
-        ctx.lineWidth = 3;
-        ctx.setLineDash([8, 4]);
-        ctx.stroke();
-        ctx.setLineDash([]);
-
-        // Anchor dot (stance foot)
-        ctx.beginPath();
-        ctx.arc(anchorX, anchorY, 10, 0, Math.PI * 2);
-        ctx.fillStyle = anchorFoot === 'left' ? 'rgba(59,130,246,0.7)' : 'rgba(239,68,68,0.7)';
+        ctx.arc(sx, dotY, 6, 0, Math.PI * 2);
+        ctx.fillStyle = step.leading_foot === 'left' ? '#3b82f6' : '#ef4444';
         ctx.fill();
-        ctx.strokeStyle = 'white';
-        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+        ctx.lineWidth = 1;
         ctx.stroke();
+      });
 
-        // Leading foot dot (moving)
-        ctx.beginPath();
-        ctx.arc(lineEndX, lineEndY, 10, 0, Math.PI * 2);
-        ctx.fillStyle = lineColor;
-        ctx.fill();
-        ctx.strokeStyle = 'white';
-        ctx.lineWidth = 2;
-        ctx.stroke();
+      // Current time indicator
+      const tNow = (currentTime - clipModal.startS) / clipDur;
+      const nowX = dotX + Math.min(1, Math.max(0, tNow)) * dotW;
+      ctx.beginPath();
+      ctx.moveTo(nowX, dotY - 10);
+      ctx.lineTo(nowX + 5, dotY - 16);
+      ctx.lineTo(nowX - 5, dotY - 16);
+      ctx.closePath();
+      ctx.fillStyle = 'white';
+      ctx.fill();
 
-        // ── Distance label on the line ──
-        const ppm = timelineMeta.ppm || 100;
-        const distPx = Math.abs(lineEndX / scaleX - anchorX / scaleX);
-        const distCm = (distPx / ppm) * 100;
-        const midX = (anchorX + lineEndX) / 2;
-        const midY = Math.min(anchorY, lineEndY) - 20;
+      // Step count
+      ctx.font = `bold ${Math.max(12, cw * 0.025)}px sans-serif`;
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#34d399';
+      ctx.fillText(`Steps: ${entry.cs}`, 12, ch - 12);
+    }
 
-        // Label background
-        const fontSize = Math.max(14, canvas.width * 0.03);
-        ctx.font = `bold ${fontSize}px sans-serif`;
-        const labelText = `${distCm.toFixed(1)} cm`;
-        const textWidth = ctx.measureText(labelText).width;
-        ctx.fillStyle = 'rgba(0,0,0,0.75)';
-        ctx.beginPath();
-        const lbx = midX - textWidth / 2 - 8;
-        const lby = midY - fontSize - 4;
-        const lbw = textWidth + 16;
-        const lbh = fontSize + 10;
-        ctx.moveTo(lbx + 6, lby);
-        ctx.lineTo(lbx + lbw - 6, lby);
-        ctx.quadraticCurveTo(lbx + lbw, lby, lbx + lbw, lby + 6);
-        ctx.lineTo(lbx + lbw, lby + lbh - 6);
-        ctx.quadraticCurveTo(lbx + lbw, lby + lbh, lbx + lbw - 6, lby + lbh);
-        ctx.lineTo(lbx + 6, lby + lbh);
-        ctx.quadraticCurveTo(lbx, lby + lbh, lbx, lby + lbh - 6);
-        ctx.lineTo(lbx, lby + 6);
-        ctx.quadraticCurveTo(lbx, lby, lbx + 6, lby);
-        ctx.closePath();
-        ctx.fill();
+    // ═══ DISTANCE (step_length, stride_length) — Phase 기반 HS 증명 ═══
+    else if (isDistance) {
+      const isStride = varName.includes('stride');
+      const lineColor = foot === 'left' ? '#3b82f6' : foot === 'right' ? '#ef4444' : '#a78bfa';
 
-        ctx.fillStyle = lineColor;
-        ctx.textAlign = 'center';
-        ctx.fillText(labelText, midX, midY);
+      drawAnkles();
 
-        // ── Phase indicator (bottom) ──
-        const phaseH = 30;
-        const phaseY = canvas.height - phaseH - 10;
-        const phaseW = canvas.width - 40;
-        ctx.fillStyle = 'rgba(0,0,0,0.6)';
-        ctx.fillRect(20, phaseY, phaseW, phaseH);
+      // Find clip steps
+      const clipSteps = stepEventsAll.filter(
+        s => s.time >= clipModal.startS - 0.5 && s.time <= clipModal.endS + 0.5
+      );
+      // Step: 해당 발의 첫 번째 이벤트, Stride: 해당 발의 마지막 이벤트 (같은 발 2번째 HS)
+      const footStepsInClip = foot ? clipSteps.filter(s => s.leading_foot === foot) : clipSteps;
+      const targetStep = isStride
+        ? (footStepsInClip.length > 0 ? footStepsInClip[footStepsInClip.length - 1] : clipSteps[clipSteps.length - 1])
+        : (footStepsInClip.length > 0 ? footStepsInClip[0] : clipSteps[0]);
 
-        // Progress bar
-        ctx.fillStyle = lineColor;
-        ctx.fillRect(20, phaseY, phaseW * progress, phaseH);
+      if (targetStep) {
+        const stepIdx = stepEventsAll.indexOf(targetStep);
+        // Step: 1칸 전 (event[i-1]→event[i]), Stride: 2칸 전 (event[i-2]→event[i], 같은 발)
+        const anchorOffset = isStride ? 2 : 1;
+        const prevStep = stepIdx >= anchorOffset ? stepEventsAll[stepIdx - anchorOffset] : null;
 
-        // Phase text
-        ctx.font = `bold ${Math.max(11, canvas.width * 0.02)}px sans-serif`;
-        ctx.textAlign = 'center';
-        ctx.fillStyle = 'white';
-        const phaseText = progress < 0.3 ? 'Initial Contact → Loading'
-          : progress < 0.7 ? 'Mid Stance → Terminal Stance'
-          : 'Pre-Swing → Swing';
-        ctx.fillText(
-          `${(leadingFoot === 'left' ? 'L' : 'R')} Step  |  ${phaseText}  |  ${(progress * 100).toFixed(0)}%`,
-          canvas.width / 2, phaseY + phaseH / 2 + 4
-        );
+        if (prevStep) {
+          const anchorFoot = prevStep.leading_foot;
+          // HS1: 앵커 발 좌표 (prevStep 시점에서 고정)
+          const hs1X = (anchorFoot === 'left' ? prevStep.left_x : prevStep.right_x) * scaleX;
+          const hs1Y = (prevStep.peak_y || entry.ly) * scaleY;
+          // HS2: 리딩 발 좌표 (targetStep 시점에서 고정)
+          const leadFoot = targetStep.leading_foot;
+          const hs2X = (leadFoot === 'left' ? targetStep.left_x : targetStep.right_x) * scaleX;
+          const hs2Y = (targetStep.peak_y || entry.ly) * scaleY;
+          // 현재 리딩 발 위치 (실시간)
+          const liveX = (leadFoot === 'left' ? entry.lx : entry.rx) * scaleX;
+          const liveY = (leadFoot === 'left' ? entry.ly : entry.ry) * scaleY;
+
+          const anchorColor = anchorFoot === 'left' ? '#3b82f6' : '#ef4444';
+          const leadColor = leadFoot === 'left' ? '#3b82f6' : '#ef4444';
+          const anchorLabel = anchorFoot === 'left' ? 'L' : 'R';
+          const leadLabel = leadFoot === 'left' ? 'L' : 'R';
+
+          // 실제 측정값 (per-step 데이터 우선, 없으면 judgment 평균)
+          const stepCm = targetStep.step_length_cm;
+          const strideCm = targetStep.stride_length_cm;
+          const actualCm = isStride ? strideCm : stepCm;
+
+          // ── Phase 판별 ──
+          const phase = currentTime < prevStep.time ? 'pre'
+            : currentTime < targetStep.time ? 'measuring'
+            : 'done';
+
+          const hsMarkerR = 12;
+          const hsFs = Math.max(13, cw * 0.028);
+
+          // ── Phase 1: HS 전 — 대기 ──
+          if (phase === 'pre') {
+            // 상단 안내
+            const infoFs = Math.max(14, cw * 0.03);
+            ctx.font = `bold ${infoFs}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'rgba(255,255,255,0.6)';
+            ctx.fillText(`${anchorLabel} Heel Strike 대기 중...`, cw / 2, 30);
+          }
+
+          // ── Phase 2: 첫 HS 발생 → 앵커 고정, 리딩 발 이동 중 ──
+          if (phase === 'measuring' || phase === 'done') {
+            // HS1 마커 (앵커 발 — 고정 좌표)
+            ctx.beginPath();
+            ctx.arc(hs1X, hs1Y, hsMarkerR, 0, Math.PI * 2);
+            ctx.fillStyle = anchorColor;
+            ctx.fill();
+            ctx.strokeStyle = 'white';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+
+            // HS1 라벨
+            const hs1LabelW = 52;
+            const hs1LabelH = hsFs + 8;
+            drawRoundedRect(ctx, hs1X - hs1LabelW / 2, hs1Y - hsMarkerR - hs1LabelH - 4, hs1LabelW, hs1LabelH, 4);
+            ctx.fillStyle = anchorColor;
+            ctx.fill();
+            ctx.font = `bold ${hsFs}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'white';
+            ctx.fillText(`${anchorLabel} HS`, hs1X, hs1Y - hsMarkerR - 8);
+          }
+
+          if (phase === 'measuring') {
+            // 점선: 앵커 → 현재 발 위치 (이동 중)
+            ctx.beginPath();
+            ctx.moveTo(hs1X, hs1Y);
+            ctx.lineTo(liveX, liveY);
+            ctx.strokeStyle = leadColor;
+            ctx.lineWidth = 3;
+            ctx.setLineDash([8, 6]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // 실시간 거리 (측정 중)
+            const ppm = timelineMeta.ppm || 100;
+            const liveDist = (Math.abs(liveX / scaleX - hs1X / scaleX) / ppm) * 100;
+            const midX = (hs1X + liveX) / 2;
+            const midY = Math.min(hs1Y, liveY) - 24;
+
+            const liveFs = Math.max(16, cw * 0.035);
+            ctx.font = `bold ${liveFs}px sans-serif`;
+            const liveText = `${liveDist.toFixed(1)} cm`;
+            const tw = ctx.measureText(liveText).width;
+
+            drawRoundedRect(ctx, midX - tw / 2 - 8, midY - liveFs - 2, tw + 16, liveFs + 10, 6);
+            ctx.fillStyle = 'rgba(0,0,0,0.6)';
+            ctx.fill();
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'rgba(255,255,255,0.7)';
+            ctx.fillText(liveText, midX, midY);
+
+            // 상단 안내: "측정 중..."
+            ctx.font = `bold ${Math.max(12, cw * 0.025)}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'rgba(255,255,255,0.5)';
+            ctx.fillText(`${leadLabel} Heel Strike 대기 중...`, cw / 2, 30);
+          }
+
+          // ── Phase 3: 두 번째 HS 완료 → 측정 확정 ──
+          if (phase === 'done') {
+            // HS2 마커 (리딩 발 — 고정 좌표)
+            ctx.beginPath();
+            ctx.arc(hs2X, hs2Y, hsMarkerR, 0, Math.PI * 2);
+            ctx.fillStyle = leadColor;
+            ctx.fill();
+            ctx.strokeStyle = 'white';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+
+            // HS2 라벨
+            const hs2LabelW = 52;
+            const hs2LabelH = hsFs + 8;
+            drawRoundedRect(ctx, hs2X - hs2LabelW / 2, hs2Y - hsMarkerR - hs2LabelH - 4, hs2LabelW, hs2LabelH, 4);
+            ctx.fillStyle = leadColor;
+            ctx.fill();
+            ctx.font = `bold ${hsFs}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'white';
+            ctx.fillText(`${leadLabel} HS`, hs2X, hs2Y - hsMarkerR - 8);
+
+            // 확정 측정선: 실선 화살표 (HS1 → HS2)
+            // Glow
+            ctx.beginPath();
+            ctx.moveTo(hs1X, hs1Y);
+            ctx.lineTo(hs2X, hs2Y);
+            ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+            ctx.lineWidth = 28;
+            ctx.stroke();
+
+            drawArrowLine(ctx, hs1X, hs1Y, hs2X, hs2Y, lineColor, 4);
+
+            // ── 확정 거리 라벨 (큰 글씨) ──
+            const midX = (hs1X + hs2X) / 2;
+            const midY = Math.min(hs1Y, hs2Y) - 30;
+            const finalCm = actualCm != null ? actualCm : 0;
+
+            const bigFs = Math.max(26, cw * 0.07);
+            ctx.font = `bold ${bigFs}px sans-serif`;
+            const finalText = `${finalCm.toFixed(1)} cm`;
+            const tw = ctx.measureText(finalText).width;
+
+            // 배경 박스
+            const boxW = tw + 32;
+            const boxH = bigFs + 20;
+            drawRoundedRect(ctx, midX - boxW / 2, midY - bigFs - 6, boxW, boxH, 8);
+            ctx.fillStyle = 'rgba(0,0,0,0.85)';
+            ctx.fill();
+            ctx.strokeStyle = lineColor;
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            ctx.textAlign = 'center';
+            ctx.fillStyle = lineColor;
+            ctx.fillText(finalText, midX, midY);
+
+            // ── 하단 판정 바 ──
+            const rangeMatch = jv?.normal_range?.match(/([\d.]+)\s*[~\u2013-]\s*([\d.]+)/);
+            const normMin = rangeMatch ? parseFloat(rangeMatch[1]) : 55;
+            const normMax = rangeMatch ? parseFloat(rangeMatch[2]) : 70;
+            const statusColor = jv?.color === 'green' ? '#22c55e' : jv?.color === 'orange' ? '#f97316' : '#9ca3af';
+
+            const barH = 40;
+            const barY = ch - barH;
+            ctx.fillStyle = 'rgba(0,0,0,0.8)';
+            ctx.fillRect(0, barY, cw, barH);
+
+            const botFs = Math.max(13, cw * 0.026);
+            ctx.font = `bold ${botFs}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.fillStyle = statusColor;
+
+            const isNormal = finalCm >= normMin && finalCm <= normMax;
+            const verdictText = isNormal
+              ? `${finalCm.toFixed(0)}cm  |  정상 범위 (${normMin}~${normMax}cm)`
+              : `${finalCm.toFixed(0)}cm  |  정상 ${normMin}~${normMax}cm  |  ${jv?.direction || ''} ${jv?.deviation != null ? jv.deviation.toFixed(0) + '%' : ''}`;
+            ctx.fillText(verdictText, cw / 2, barY + barH / 2 + botFs * 0.35);
+          }
+        }
       }
     }
 
-    // ── HUD (top-right): speed, time ──
-    const hudSize = Math.max(12, canvas.width * 0.022);
-    ctx.font = `bold ${hudSize}px sans-serif`;
-    ctx.textAlign = 'right';
-    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    ctx.fillRect(canvas.width - 150, 8, 142, hudSize * 2.5 + 8);
-    ctx.fillStyle = '#22d3ee';
-    ctx.fillText(`Speed: ${entry.spd.toFixed(2)} m/s`, canvas.width - 16, 8 + hudSize + 2);
-    ctx.fillStyle = '#fbbf24';
-    const elapsedT = currentTime - timelineMeta.start_t;
-    ctx.fillText(`Time: ${elapsedT > 0 ? elapsedT.toFixed(2) : '0.00'}s`, canvas.width - 16, 8 + hudSize * 2.2 + 2);
+    // ═══ TIME (step_time, stride_time) — HS phase 기반 (distance와 동일 구조) ═══
+    else if (isTime) {
+      const isStride = varName.includes('stride');
+      const lineColor = foot === 'left' ? '#3b82f6' : foot === 'right' ? '#ef4444' : '#fbbf24';
+
+      drawAnkles();
+
+      // Find clip steps
+      const clipSteps = stepEventsAll.filter(
+        s => s.time >= clipModal.startS - 0.5 && s.time <= clipModal.endS + 0.5
+      );
+      const footStepsInClip = foot ? clipSteps.filter(s => s.leading_foot === foot) : clipSteps;
+      const targetStep = isStride
+        ? (footStepsInClip.length > 0 ? footStepsInClip[footStepsInClip.length - 1] : clipSteps[clipSteps.length - 1])
+        : (footStepsInClip.length > 0 ? footStepsInClip[0] : clipSteps[0]);
+
+      if (targetStep) {
+        const stepIdx = stepEventsAll.indexOf(targetStep);
+        const anchorOffset = isStride ? 2 : 1;
+        const prevStep = stepIdx >= anchorOffset ? stepEventsAll[stepIdx - anchorOffset] : null;
+
+        if (prevStep) {
+          const anchorFoot = prevStep.leading_foot;
+          const hs1X = (anchorFoot === 'left' ? prevStep.left_x : prevStep.right_x) * scaleX;
+          const hs1Y = (prevStep.peak_y || entry.ly) * scaleY;
+          const leadFoot = targetStep.leading_foot;
+          const hs2X = (leadFoot === 'left' ? targetStep.left_x : targetStep.right_x) * scaleX;
+          const hs2Y = (targetStep.peak_y || entry.ly) * scaleY;
+
+          const anchorColor = anchorFoot === 'left' ? '#3b82f6' : '#ef4444';
+          const leadColor = leadFoot === 'left' ? '#3b82f6' : '#ef4444';
+          const anchorLabel = anchorFoot === 'left' ? 'L' : 'R';
+          const leadLabel = leadFoot === 'left' ? 'L' : 'R';
+
+          // 실제 측정값
+          const actualTime = targetStep.step_time_s;
+          const hs1Time = prevStep.time;
+          const hs2Time = targetStep.time;
+
+          const phase = currentTime < hs1Time ? 'pre'
+            : currentTime < hs2Time ? 'measuring'
+            : 'done';
+
+          const hsMarkerR = 12;
+          const hsFs = Math.max(13, cw * 0.028);
+
+          // ── Phase 1: HS 전 ──
+          if (phase === 'pre') {
+            ctx.font = `bold ${Math.max(14, cw * 0.03)}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'rgba(255,255,255,0.6)';
+            ctx.fillText(`${anchorLabel} Heel Strike 대기 중...`, cw / 2, 30);
+          }
+
+          // ── Phase 2+3 공통: HS1 마커 ──
+          if (phase === 'measuring' || phase === 'done') {
+            ctx.beginPath();
+            ctx.arc(hs1X, hs1Y, hsMarkerR, 0, Math.PI * 2);
+            ctx.fillStyle = anchorColor;
+            ctx.fill();
+            ctx.strokeStyle = 'white';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+
+            const hs1LabelW = 52;
+            const hs1LabelH = hsFs + 8;
+            drawRoundedRect(ctx, hs1X - hs1LabelW / 2, hs1Y - hsMarkerR - hs1LabelH - 4, hs1LabelW, hs1LabelH, 4);
+            ctx.fillStyle = anchorColor;
+            ctx.fill();
+            ctx.font = `bold ${hsFs}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'white';
+            ctx.fillText(`${anchorLabel} HS`, hs1X, hs1Y - hsMarkerR - 8);
+          }
+
+          // ── Phase 2: 측정 중 — 스톱워치 카운트업 ──
+          if (phase === 'measuring') {
+            const elapsed = currentTime - hs1Time;
+
+            // 큰 스톱워치
+            const bigFs = Math.max(44, cw * 0.11);
+            ctx.font = `bold ${bigFs}px monospace`;
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'rgba(0,0,0,0.5)';
+            ctx.fillText(elapsed.toFixed(3), cw / 2 + 2, ch * 0.38 + 2);
+            ctx.fillStyle = '#fbbf24';
+            ctx.fillText(elapsed.toFixed(3), cw / 2, ch * 0.38);
+
+            ctx.font = `${Math.max(14, cw * 0.03)}px sans-serif`;
+            ctx.fillStyle = 'rgba(255,255,255,0.5)';
+            ctx.fillText(`${leadLabel} Heel Strike 대기 중...`, cw / 2, ch * 0.38 + bigFs * 0.45);
+          }
+
+          // ── Phase 3: 측정 완료 ──
+          if (phase === 'done') {
+            // HS2 마커
+            ctx.beginPath();
+            ctx.arc(hs2X, hs2Y, hsMarkerR, 0, Math.PI * 2);
+            ctx.fillStyle = leadColor;
+            ctx.fill();
+            ctx.strokeStyle = 'white';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+
+            const hs2LabelW = 52;
+            const hs2LabelH = hsFs + 8;
+            drawRoundedRect(ctx, hs2X - hs2LabelW / 2, hs2Y - hsMarkerR - hs2LabelH - 4, hs2LabelW, hs2LabelH, 4);
+            ctx.fillStyle = leadColor;
+            ctx.fill();
+            ctx.font = `bold ${hsFs}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'white';
+            ctx.fillText(`${leadLabel} HS`, hs2X, hs2Y - hsMarkerR - 8);
+
+            // 연결선 (시간이라 점선)
+            ctx.beginPath();
+            ctx.moveTo(hs1X, hs1Y);
+            ctx.lineTo(hs2X, hs2Y);
+            ctx.strokeStyle = 'rgba(251,191,36,0.4)';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([6, 4]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // 확정 시간 (큰 글씨)
+            const finalTime = actualTime != null ? actualTime : (hs2Time - hs1Time);
+            const bigFs = Math.max(44, cw * 0.11);
+            ctx.font = `bold ${bigFs}px monospace`;
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'rgba(0,0,0,0.5)';
+            ctx.fillText(finalTime.toFixed(3), cw / 2 + 2, ch * 0.38 + 2);
+            ctx.fillStyle = '#fbbf24';
+            ctx.fillText(finalTime.toFixed(3), cw / 2, ch * 0.38);
+
+            ctx.font = `${Math.max(16, cw * 0.035)}px sans-serif`;
+            ctx.fillStyle = 'rgba(255,255,255,0.7)';
+            ctx.fillText('seconds', cw / 2, ch * 0.38 + bigFs * 0.4);
+
+            // 하단 판정 바
+            const rangeMatch = jv?.normal_range?.match(/([\d.]+)\s*[~\u2013-]\s*([\d.]+)/);
+            const normMin = rangeMatch ? parseFloat(rangeMatch[1]) : 0.4;
+            const normMax = rangeMatch ? parseFloat(rangeMatch[2]) : 0.6;
+            const statusColor = jv?.color === 'green' ? '#22c55e' : jv?.color === 'orange' ? '#f97316' : '#9ca3af';
+
+            const barH = 40;
+            const barY = ch - barH;
+            ctx.fillStyle = 'rgba(0,0,0,0.8)';
+            ctx.fillRect(0, barY, cw, barH);
+
+            const botFs = Math.max(13, cw * 0.026);
+            ctx.font = `bold ${botFs}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.fillStyle = statusColor;
+
+            const isNormal = finalTime >= normMin && finalTime <= normMax;
+            const typeLabel = isStride ? 'Stride Time' : 'Step Time';
+            const verdictText = isNormal
+              ? `${typeLabel}: ${finalTime.toFixed(3)}s  |  정상 (${normMin}~${normMax}s)`
+              : `${typeLabel}: ${finalTime.toFixed(3)}s  |  정상 ${normMin}~${normMax}s  |  ${jv?.direction || ''} ${jv?.deviation != null ? jv.deviation.toFixed(0) + '%' : ''}`;
+            ctx.fillText(verdictText, cw / 2, barY + barH / 2 + botFs * 0.35);
+          }
+        }
+      }
+    }
+
+    // ═══ RATIO (swing/stance) ═══
+    else if (isRatio) {
+      const isSwing = varName.includes('swing');
+      drawJudgmentBanner(ctx, cw, jv, isSwing ? 'Swing 비율' : 'Stance 비율');
+      drawAnkles();
+
+      // Foot state labels based on ankle velocity
+      const prevEntry = getTimelineEntry(currentTime - 0.05);
+      if (prevEntry) {
+        const lvx = Math.abs(entry.lx - prevEntry.lx);
+        const rvx = Math.abs(entry.rx - prevEntry.rx);
+        const threshold = Math.max(lvx, rvx) * 0.4;
+
+        const leftState = lvx > threshold ? 'SWING' : 'STANCE';
+        const rightState = rvx > threshold ? 'SWING' : 'STANCE';
+
+        const labelFs = Math.max(11, cw * 0.022);
+        ctx.font = `bold ${labelFs}px sans-serif`;
+        ctx.textAlign = 'center';
+
+        // Left foot state badge
+        const llx = entry.lx * scaleX;
+        const lly = entry.ly * scaleY + 22;
+        drawRoundedRect(ctx, llx - 30, lly - labelFs + 2, 60, labelFs + 6, 4);
+        ctx.fillStyle = leftState === 'SWING' ? 'rgba(59,130,246,0.85)' : 'rgba(59,130,246,0.35)';
+        ctx.fill();
+        ctx.fillStyle = 'white';
+        ctx.fillText(leftState, llx, lly);
+
+        // Right foot state badge
+        const rlx = entry.rx * scaleX;
+        const rly = entry.ry * scaleY + 22;
+        drawRoundedRect(ctx, rlx - 30, rly - labelFs + 2, 60, labelFs + 6, 4);
+        ctx.fillStyle = rightState === 'SWING' ? 'rgba(239,68,68,0.85)' : 'rgba(239,68,68,0.35)';
+        ctx.fill();
+        ctx.fillStyle = 'white';
+        ctx.fillText(rightState, rlx, rly);
+      }
+
+      // Ratio bars
+      const barAreaY = ch * 0.35;
+      const barW = cw * 0.7;
+      const barX = (cw - barW) / 2;
+      const barH = 22;
+
+      // Left foot bar
+      const lSwing = metricsData?.left_swing_pct || 40;
+      const lStance = metricsData?.left_stance_pct || 60;
+
+      ctx.font = `bold ${Math.max(12, cw * 0.025)}px sans-serif`;
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#93c5fd';
+      ctx.fillText('L', barX - 8, barAreaY + barH / 2 + 5);
+
+      drawRoundedRect(ctx, barX, barAreaY, barW, barH, 4);
+      ctx.fillStyle = 'rgba(255,255,255,0.1)';
+      ctx.fill();
+
+      const lSwingW = (lSwing / 100) * barW;
+      ctx.fillStyle = 'rgba(59,130,246,0.7)';
+      ctx.fillRect(barX, barAreaY, lSwingW, barH);
+      ctx.fillStyle = 'rgba(59,130,246,0.3)';
+      ctx.fillRect(barX + lSwingW, barAreaY, barW - lSwingW, barH);
+
+      ctx.font = `bold ${Math.max(10, cw * 0.02)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'white';
+      if (lSwingW > 40) ctx.fillText(`Sw ${lSwing.toFixed(0)}%`, barX + lSwingW / 2, barAreaY + barH / 2 + 4);
+      if (barW - lSwingW > 40) ctx.fillText(`St ${lStance.toFixed(0)}%`, barX + lSwingW + (barW - lSwingW) / 2, barAreaY + barH / 2 + 4);
+
+      // Right foot bar
+      const rBarY = barAreaY + barH + 12;
+      const rSwing = metricsData?.right_swing_pct || 40;
+      const rStance = metricsData?.right_stance_pct || 60;
+
+      ctx.font = `bold ${Math.max(12, cw * 0.025)}px sans-serif`;
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#fca5a5';
+      ctx.fillText('R', barX - 8, rBarY + barH / 2 + 5);
+
+      drawRoundedRect(ctx, barX, rBarY, barW, barH, 4);
+      ctx.fillStyle = 'rgba(255,255,255,0.1)';
+      ctx.fill();
+
+      const rSwingW = (rSwing / 100) * barW;
+      ctx.fillStyle = 'rgba(239,68,68,0.7)';
+      ctx.fillRect(barX, rBarY, rSwingW, barH);
+      ctx.fillStyle = 'rgba(239,68,68,0.3)';
+      ctx.fillRect(barX + rSwingW, rBarY, barW - rSwingW, barH);
+
+      ctx.font = `bold ${Math.max(10, cw * 0.02)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'white';
+      if (rSwingW > 40) ctx.fillText(`Sw ${rSwing.toFixed(0)}%`, barX + rSwingW / 2, rBarY + barH / 2 + 4);
+      if (barW - rSwingW > 40) ctx.fillText(`St ${rStance.toFixed(0)}%`, barX + rSwingW + (barW - rSwingW) / 2, rBarY + barH / 2 + 4);
+
+      // Normal 40% reference line
+      const refX = barX + (40 / 100) * barW;
+      ctx.beginPath();
+      ctx.setLineDash([4, 4]);
+      ctx.moveTo(refX, barAreaY - 8);
+      ctx.lineTo(refX, rBarY + barH + 8);
+      ctx.strokeStyle = 'rgba(34,197,94,0.7)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.font = `${Math.max(9, cw * 0.018)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(34,197,94,0.8)';
+      ctx.fillText('40%', refX, barAreaY - 12);
+
+      // Big ratio value (bottom center)
+      if (jv && jv.measured_value != null) {
+        const bigFs = Math.max(32, cw * 0.08);
+        ctx.font = `bold ${bigFs}px sans-serif`;
+        ctx.textAlign = 'center';
+        const valColor = jv.color === 'green' ? '#22c55e' : jv.color === 'orange' ? '#f97316' : 'white';
+        ctx.fillStyle = 'rgba(0,0,0,0.4)';
+        ctx.fillText(`${jv.measured_value.toFixed(1)}%`, cw / 2 + 1, ch * 0.72 + 1);
+        ctx.fillStyle = valColor;
+        ctx.fillText(`${jv.measured_value.toFixed(1)}%`, cw / 2, ch * 0.72);
+
+        ctx.font = `${Math.max(12, cw * 0.025)}px sans-serif`;
+        ctx.fillStyle = 'rgba(255,255,255,0.6)';
+        ctx.fillText(jv.display_name, cw / 2, ch * 0.72 + bigFs * 0.35);
+      }
+    }
+
+    // ═══ FALLBACK ═══
+    else {
+      drawAnkles();
+
+      const hudSize = Math.max(12, cw * 0.022);
+      ctx.font = `bold ${hudSize}px sans-serif`;
+      ctx.textAlign = 'right';
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(cw - 150, 8, 142, hudSize * 2.5 + 8);
+      ctx.fillStyle = '#22d3ee';
+      ctx.fillText(`Speed: ${entry.spd.toFixed(2)} m/s`, cw - 16, 8 + hudSize + 2);
+      ctx.fillStyle = '#fbbf24';
+      const elapsedT = currentTime - timelineMeta.start_t;
+      ctx.fillText(`Time: ${elapsedT > 0 ? elapsedT.toFixed(2) : '0.00'}s`, cw - 16, 8 + hudSize * 2.2 + 2);
+    }
 
     if (!video.paused) {
       clipAnimRef.current = requestAnimationFrame(renderClipOverlay);
     }
-  }, [clipModal, getTimelineEntry, timelineMeta, stepEventsAll]);
+  }, [clipModal, getTimelineEntry, timelineMeta, stepEventsAll, metricsData]);
 
   // 모달 열릴 때 영상 시간 설정 + overlay 시작
   useEffect(() => {
@@ -631,14 +1264,6 @@ export default function AIResultPage() {
   const judgment = metrics.judgment as GaitJudgment | undefined;
   const velocity = judgment?.velocity;
   const clinical = metrics.clinical;
-
-  // 변수 판정 결과를 키로 빠르게 조회
-  const varMap = new Map<string, JudgmentVariable>();
-  if (judgment?.variables) {
-    for (const v of judgment.variables) {
-      varMap.set(v.variable_name, v);
-    }
-  }
 
   // Perry 분류 색상 매핑
   const velocityColors = velocity
@@ -1175,13 +1800,15 @@ export default function AIResultPage() {
                               onClick={() => {
                                 const clipStart = Math.max(timelineMeta?.start_t || 0, step.time - 0.5);
                                 const clipEnd = step.time + 0.5;
+                                const vn = isLeft ? 'left_step_length_cm' : 'right_step_length_cm';
                                 setClipModal({
                                   open: true,
                                   label: `Step #${step.step_num} (${isLeft ? 'L' : 'R'})`,
                                   startS: clipStart,
                                   endS: clipEnd,
-                                  variableName: isLeft ? 'left_step_length_cm' : 'right_step_length_cm',
+                                  variableName: vn,
                                   foot: step.leading_foot,
+                                  judgment: varMap.get(vn) || null,
                                 });
                               }}
                               className={`p-1 rounded transition-colors ${isLeft ? 'bg-blue-100 hover:bg-blue-200' : 'bg-red-100 hover:bg-red-200'}`}
@@ -1257,12 +1884,20 @@ export default function AIResultPage() {
                     {metrics.step_time_si?.toFixed(0) || "-"}
                   </td>
                   <td className="text-center py-2">
-                    {evidenceClips['step_time_s'] && (
-                      <button onClick={() => openClip('step_time_s')}
-                        className="p-1 rounded bg-gray-50 hover:bg-gray-100 transition-colors" title="Step Time 재생">
-                        <Play className="h-3.5 w-3.5 text-gray-500" />
-                      </button>
-                    )}
+                    <div className="flex justify-center gap-1">
+                      {evidenceClips['left_step_time_s'] && (
+                        <button onClick={() => openClip('left_step_time_s')}
+                          className="p-1 rounded bg-blue-50 hover:bg-blue-100 transition-colors" title="L Step Time 재생">
+                          <Play className="h-3.5 w-3.5 text-blue-500" />
+                        </button>
+                      )}
+                      {evidenceClips['right_step_time_s'] && (
+                        <button onClick={() => openClip('right_step_time_s')}
+                          className="p-1 rounded bg-red-50 hover:bg-red-100 transition-colors" title="R Step Time 재생">
+                          <Play className="h-3.5 w-3.5 text-red-500" />
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
                 <tr className="border-b">
@@ -1277,12 +1912,20 @@ export default function AIResultPage() {
                     {metrics.stride_time_si?.toFixed(0) || "-"}
                   </td>
                   <td className="text-center py-2">
-                    {evidenceClips['stride_time_s'] && (
-                      <button onClick={() => openClip('stride_time_s')}
-                        className="p-1 rounded bg-gray-50 hover:bg-gray-100 transition-colors" title="Stride Time 재생">
-                        <Play className="h-3.5 w-3.5 text-gray-500" />
-                      </button>
-                    )}
+                    <div className="flex justify-center gap-1">
+                      {evidenceClips['left_stride_time_s'] && (
+                        <button onClick={() => openClip('left_stride_time_s')}
+                          className="p-1 rounded bg-blue-50 hover:bg-blue-100 transition-colors" title="L Stride Time 재생">
+                          <Play className="h-3.5 w-3.5 text-blue-500" />
+                        </button>
+                      )}
+                      {evidenceClips['right_stride_time_s'] && (
+                        <button onClick={() => openClip('right_stride_time_s')}
+                          className="p-1 rounded bg-red-50 hover:bg-red-100 transition-colors" title="R Stride Time 재생">
+                          <Play className="h-3.5 w-3.5 text-red-500" />
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
                 <tr className="border-b">

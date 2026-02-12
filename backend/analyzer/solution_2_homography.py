@@ -68,9 +68,14 @@ class PerspectiveCorrector:
         stage_front_y = self._detect_stage_edge(first_frame, wall_y, h)
         
         if stage_front_y is None or abs(stage_front_y - wall_y) < 10:
-            print("[PerspectiveCorrector] 무대 에지 미검출. 보정 없이 진행합니다.")
-            self._setup_identity(marker_info, actual_distance_m, w)
-            return
+            # Fallback: 영상 하단 85% 지점을 바닥 앞쪽으로 추정
+            # 측면 카메라 복도 환경에서 Hough 에지 미검출 시 사용
+            stage_front_y = h * 0.85
+            if abs(stage_front_y - wall_y) < 10:
+                print("[PerspectiveCorrector] 무대 에지 미검출. 보정 없이 진행합니다.")
+                self._setup_identity(marker_info, actual_distance_m, w)
+                return
+            print(f"[PerspectiveCorrector] 에지 미검출 → 추정값 사용: front_y={stage_front_y:.0f}")
         
         # 깊이 추정
         if stage_depth_m is None:

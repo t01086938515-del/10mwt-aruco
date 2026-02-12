@@ -10,6 +10,7 @@ numpy>=1.24.0
 # AI/ML
 ultralytics>=8.0.200
 torch>=2.0.0
+mediapipe>=0.10.9
 
 # Signal Processing
 scipy>=1.11.0

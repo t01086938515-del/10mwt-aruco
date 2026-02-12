@@ -72,3 +72,19 @@ uploads/
 
 # Windows artifacts
 nul
+
+# Test results / batch outputs
+results/
+batch_results/
+consistency_results/
+ws_consistency_results/
+
+# Video / overlay clips
+overlay_clips/
+sigital/
+
+# Verification data
+정확도 검증/
+
+# Workspace
+*.code-workspace

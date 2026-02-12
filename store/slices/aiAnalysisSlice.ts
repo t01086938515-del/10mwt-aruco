@@ -184,4 +184,4 @@ export const selectProgress = (state: { aiAnalysis: AIAnalysisState }) =>
   state.aiAnalysis.progress;
 
 export const selectGaitMetrics = (state: { aiAnalysis: AIAnalysisState }) =>
-  state.aiAnalysis.result?.metrics ?? null;
+  state.aiAnalysis.result?.results ?? null;
