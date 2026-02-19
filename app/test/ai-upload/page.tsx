@@ -20,6 +20,7 @@ import {
 export default function AIUploadPage() {
   const router = useRouter();
   const { config } = useAppSelector((state) => state.testSession);
+  const { currentPatient } = useAppSelector((state) => state.patient);
   const { startAnalysis, status, error } = useAIAnalysis();
 
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -85,9 +86,15 @@ export default function AIUploadPage() {
   const handleStartAnalysis = async () => {
     if (!selectedFile) return;
 
+    const heightCm = config.patientHeight || currentPatient?.height;
+    if (!heightCm) {
+      alert("환자 키 정보가 없습니다. 설정으로 돌아가 키를 입력해주세요.");
+      return;
+    }
+
     await startAnalysis(selectedFile, {
       walkDistance: config.distance,
-      markerSize: config.markerSize,
+      patientHeightM: heightCm / 100,
     });
 
     // 분석 시작하면 분석 페이지로 이동
@@ -128,7 +135,7 @@ export default function AIUploadPage() {
               <div>
                 <p className="font-medium">{config.patientName}</p>
                 <p className="text-sm text-gray-500">
-                  측정 거리: {config.distance}m | 마커 크기: {config.markerSize}m
+                  측정 거리: {config.distance}m | 키: {config.patientHeight || currentPatient?.height || "미입력"}cm
                 </p>
               </div>
             </div>
@@ -234,9 +241,9 @@ export default function AIUploadPage() {
             <ul className="space-y-3">
               {[
                 "카메라를 보행 경로의 측면에 고정하세요",
-                "측정 구간 양끝에 ArUco 마커를 설치하세요",
                 "환자의 전신이 화면에 보이도록 촬영하세요",
                 "보행 시작 전후로 2-3초 여유를 두세요",
+                "환자가 프레임 안으로 걸어 들어오고 나가는 모습을 촬영하세요",
               ].map((tip, index) => (
                 <li key={index} className="flex items-start gap-2">
                   <CheckCircle className="mt-0.5 h-4 w-4 shrink-0 text-green-500" />

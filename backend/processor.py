@@ -1,13 +1,15 @@
-# backend/processor.py - Updated with stride L/R debug
+# backend/processor.py
 """프레임별 분석 코디네이터 (횡방향 분석용)
 
-MediaPipe Pose Heavy + ArUco 마커 → 진행률(progress) 기반 타이밍.
-사람의 발 X좌표를 시작마커→끝마커 벡터에 투영하여 0~1 진행률 산출.
+키(신장) 기반 캘리브레이션 + MediaPipe Pose Heavy.
+사람의 키 픽셀 높이로 pixels_per_meter를 추정하고,
+전신 프레임 진입/퇴장으로 보행 구간을 자동 감지.
 
 횡방향 분석:
 - 카메라가 측면에서 촬영 (사람이 좌→우 또는 우→좌로 이동)
 - X좌표 기반 진행률 계산
 - 케이던스/보폭 추정 (발목 좌표 분석)
+- 동적 PPM으로 원근 자동 보정
 """
 
 import cv2
@@ -18,13 +20,11 @@ from typing import Dict, List, Optional, Callable, Tuple
 from pathlib import Path
 from scipy import signal
 
-from analyzer.aruco_calibrator import ArucoCalibrator
 from analyzer.pose_detector import PoseDetector
 from analyzer.gait_analyzer import GaitAnalyzer
 from analyzer.gait_judgment import judge_all
 from analyzer.calibration import DistanceCalibrator
 from analyzer.filter import KalmanFilter2D
-from analyzer.solution_2_homography import PerspectiveCorrector
 from utils.video_utils import VideoReader
 
 
@@ -34,19 +34,9 @@ class FrameProcessor:
     def __init__(
         self,
         model_path: str = "",
-        marker_size_m: float = 0.2,
-        start_marker_id: int = 0,
-        finish_marker_id: int = 1,
-        marker_distance_m: float = 10.0,
+        walk_distance_m: float = 10.0,
+        patient_height_m: float | None = None,
     ):
-        # ArUco 보정기
-        self.aruco = ArucoCalibrator(
-            marker_size_m=marker_size_m,
-            start_marker_id=start_marker_id,
-            finish_marker_id=finish_marker_id,
-            marker_distance_m=marker_distance_m,
-        )
-
         # MediaPipe Pose Heavy (단일 사람 감지)
         self.pose_detector = PoseDetector(
             model_path=model_path,
@@ -60,9 +50,25 @@ class FrameProcessor:
         self.calibrator = DistanceCalibrator()
         self.gait_analyzer: Optional[GaitAnalyzer] = None
 
-        # 원근 보정 (#2 Homography)
-        self.perspective_corrector = PerspectiveCorrector()
-        self._first_frame: Optional[np.ndarray] = None
+        # 보행 거리 (설정값)
+        self.walk_distance_m = walk_distance_m
+
+        # 키 기반 캘리브레이션
+        self.patient_height_m = patient_height_m
+        self.calibrated = False
+        self.height_based_ppm: Optional[float] = None
+        self.height_samples: List[float] = []
+
+        # 전신 감지용 (시작/종료)
+        self.body_was_visible = False
+        self.start_foot_x: Optional[float] = None
+        self.finish_foot_x: Optional[float] = None
+        self.virtual_start_x: Optional[float] = None
+        self.virtual_finish_x: Optional[float] = None
+        self._height_mode_distance: Optional[float] = None
+        self._last_visible_foot_x: Optional[float] = None
+        self._invisible_count = 0  # 연속 미감지 프레임 수 (디바운스)
+        self._min_elapsed_s = max(walk_distance_m / 3.0, 3.0)  # 최소 경과시간 (10m → 3.3s)
 
         # 상태
         self.prev_progress: Optional[float] = None
@@ -75,7 +81,7 @@ class FrameProcessor:
         self.crossing_events: List[Dict] = []
 
         # 케이던스/보폭 추정을 위한 발목 좌표 기록
-        self.ankle_history: List[Dict] = []  # [{timestamp_s, left_ankle, right_ankle, left_y, right_y}]
+        self.ankle_history: List[Dict] = []
         self.fps: float = 30.0
 
         # 디버그
@@ -93,17 +99,102 @@ class FrameProcessor:
         self.crossing_events = []
         self.ankle_history = []
         self._debug_frame_count = 0
-        self.perspective_corrector = PerspectiveCorrector()
-        self._first_frame = None
-        # 보행 방향 초기화
-        if hasattr(self.aruco, '_walking_direction'):
-            self.aruco._walking_direction = None
-            self.aruco._progress_samples = []
-            self.aruco._initial_progress = None
+        self.calibrated = False
+        self.height_based_ppm = None
+        self.height_samples = []
+        self.body_was_visible = False
+        self.start_foot_x = None
+        self.finish_foot_x = None
+        self.virtual_start_x = None
+        self.virtual_finish_x = None
+        self._height_mode_distance = None
+        self._last_visible_foot_x = None
+        self._invisible_count = 0
 
     def set_fps(self, fps: float):
         """영상 FPS 설정"""
         self.fps = fps
+
+    def _is_full_body_visible(self, keypoints: List, bbox: List, frame_w: int, frame_h: int) -> bool:
+        """전신이 프레임 안에 완전히 보이는지 판별
+
+        조건:
+        - nose(0), hips(23,24), ankles(27,28) 신뢰도 > 0.5
+        - bbox가 프레임 경계에서 5% 이상 안쪽
+        """
+        # 주요 관절 신뢰도 체크
+        required_indices = [0, 23, 24, 27, 28]  # nose, L/R hip, L/R ankle
+        for idx in required_indices:
+            if idx >= len(keypoints):
+                return False
+            kp = keypoints[idx]
+            if len(kp) < 3 or kp[2] < 0.5:
+                return False
+
+        # bbox 경계 체크 (5% 마진)
+        margin_x = frame_w * 0.05
+        margin_y = frame_h * 0.05
+        x1, y1, x2, y2 = bbox[0], bbox[1], bbox[2], bbox[3]
+
+        if x1 < margin_x or x2 > frame_w - margin_x:
+            return False
+        if y1 < margin_y or y2 > frame_h - margin_y:
+            return False
+
+        return True
+
+    def _sample_person_height(self, keypoints: List) -> Optional[float]:
+        """키포인트에서 사람 키 픽셀 높이 측정
+
+        nose_y ~ max(ankle_left_y, ankle_right_y) 픽셀 차이
+        """
+        if len(keypoints) <= 28:
+            return None
+
+        nose = keypoints[0]
+        left_ankle = keypoints[27]
+        right_ankle = keypoints[28]
+
+        # 신뢰도 체크
+        if len(nose) < 3 or nose[2] < 0.5:
+            return None
+        if len(left_ankle) < 3 or left_ankle[2] < 0.5:
+            return None
+        if len(right_ankle) < 3 or right_ankle[2] < 0.5:
+            return None
+
+        # 발목 중 더 낮은(큰 y) 위치 사용
+        ankle_y = max(left_ankle[1], right_ankle[1])
+        height_px = abs(ankle_y - nose[1])
+
+        # 범위 체크 (100~800px)
+        if 100 <= height_px <= 800:
+            return height_px
+        return None
+
+    def try_calibrate_with_height(self) -> bool:
+        """키 샘플에서 ppm 계산 시도
+
+        height_samples 10개 이상 필요
+        ppm = median(height_px) / patient_height_m
+        """
+        if not self.patient_height_m or self.patient_height_m <= 0:
+            return False
+        if len(self.height_samples) < 10:
+            return False
+
+        median_height_px = float(np.median(self.height_samples))
+        self.height_based_ppm = median_height_px / self.patient_height_m
+        self.calibrated = True
+        print(f"[Processor] Height-based calibration: "
+              f"median_height_px={median_height_px:.1f}, "
+              f"patient_height_m={self.patient_height_m:.2f}, "
+              f"ppm={self.height_based_ppm:.1f}")
+        return True
+
+    def _get_effective_ppm(self) -> Optional[float]:
+        """캘리브레이션된 PPM 반환"""
+        return self.height_based_ppm
 
     def process_frame(
         self,
@@ -115,66 +206,15 @@ class FrameProcessor:
         result = {
             'frame_idx': frame_idx,
             'timestamp_s': round(timestamp_s, 4),
-            'markers': [],
-            'num_markers': 0,
             'person': None,
             'timer': {
                 'state': self.timer_state,
                 'elapsed_s': round(self.timer_elapsed_s, 3),
             },
             'crossing_event': None,
-            'calibration': {'calibrated': self.aruco.calibrated},
+            'calibration': {'calibrated': self.calibrated},
             'results': None,
         }
-
-        # 첫 프레임 저장 (원근 보정용)
-        if self._first_frame is None:
-            self._first_frame = frame.copy()
-
-        # 1) ArUco 마커 감지 (보정 완료 후에는 매 30프레임만 - 성능 최적화)
-        run_aruco = (not self.aruco.calibrated) or (frame_idx % 30 == 0)
-        if run_aruco:
-            marker_result = self.aruco.detect_markers(frame)
-            result['markers'] = marker_result['markers']
-            result['num_markers'] = marker_result['num_markers']
-            self._last_markers = marker_result
-        elif hasattr(self, '_last_markers'):
-            result['markers'] = self._last_markers['markers']
-            result['num_markers'] = self._last_markers['num_markers']
-
-        # 2) 보정 시도
-        if not self.aruco.calibrated:
-            if self.aruco.try_calibrate():
-                result['calibration'] = self.aruco.get_calibration_info()
-                print(f"[Processor] Calibration done at frame {frame_idx} ({timestamp_s:.2f}s)")
-                # 원근 보정기 캘리브레이션 (#2 Homography)
-                if self._first_frame is not None:
-                    marker_info = {}
-                    sc = self.aruco.start_center_px
-                    fc = self.aruco.finish_center_px
-                    if sc and fc:
-                        marker_info[0] = {'cx': sc[0], 'cy': sc[1], 'size': 20}
-                        marker_info[1] = {'cx': fc[0], 'cy': fc[1], 'size': 20}
-                        self.perspective_corrector.calibrate(
-                            self._first_frame, marker_info,
-                            actual_distance_m=self.aruco.marker_distance_m
-                        )
-
-        # 2.5) 원근 보정기 캘리브레이션 (ArUco 보정 완료 후 1회)
-        # 2-pass 분석에서 ArUco가 Pass 1에서 보정 완료되면
-        # Pass 2의 process_frame에서 캘리브레이션 블록을 건너뛸 수 있으므로 별도 체크
-        if (self.aruco.calibrated and not self.perspective_corrector.calibrated
-                and self._first_frame is not None):
-            marker_info = {}
-            sc = self.aruco.start_center_px
-            fc = self.aruco.finish_center_px
-            if sc and fc:
-                marker_info[0] = {'cx': sc[0], 'cy': sc[1], 'size': 20}
-                marker_info[1] = {'cx': fc[0], 'cy': fc[1], 'size': 20}
-                self.perspective_corrector.calibrate(
-                    self._first_frame, marker_info,
-                    actual_distance_m=self.aruco.marker_distance_m
-                )
 
         # 3) MediaPipe Pose 감지 (단일 사람)
         pose_result = self.pose_detector.detect(frame)
@@ -240,73 +280,106 @@ class FrameProcessor:
                     history_entry['right_toe_x'] = right_toe[0]
                     history_entry['right_toe_y'] = right_toe[1]
 
+                # height 모드: 매 프레임 키 픽셀 높이 기록 (동적 PPM → 원근보정)
+                if self.patient_height_m:
+                    h_px = self._sample_person_height(keypoints)
+                    if h_px is not None:
+                        history_entry['height_px'] = h_px
+
                 self.ankle_history.append(history_entry)
 
-            # 진행률 계산 (0=시작, 1=끝) - 횡방향은 X좌표 기반
-            if self.aruco.calibrated:
-                # bbox 높이 (사람 키 pixel) - 횡방향에서는 참고용
+            # 진행률 계산 — 전신 감지 기반 시작/종료
+            if self.calibrated and self.height_based_ppm:
+                frame_h, frame_w = frame.shape[:2]
+                keypoints = best_track['keypoints']
                 bbox = best_track['bbox']
-                person_height_px = bbox[3] - bbox[1]
+                foot_x = filtered_ground[0]
+                is_visible = self._is_full_body_visible(keypoints, bbox, frame_w, frame_h)
 
-                # 횡방향 진행률 계산 (X좌표 기반)
-                progress = self.aruco.get_walking_progress(
-                    filtered_ground[0], filtered_ground[1],
-                    person_height_px=person_height_px,
+                # START: 전신 처음 보임 (body_was_visible: False → True)
+                if self.timer_state == 'standby' and is_visible and not self.body_was_visible:
+                    self.start_foot_x = foot_x
+                    self.timer_state = 'running'
+                    self.timer_start_time_s = timestamp_s
+                    self.virtual_start_x = foot_x
+                    # 가상 끝점: 반대쪽 프레임 경계 (10% 마진)
+                    self.virtual_finish_x = frame_w * 0.9 if foot_x < frame_w / 2 else frame_w * 0.1
+                    result['crossing_event'] = 'start'
+                    self.crossing_events.append({
+                        'line': 'start',
+                        'timestamp_s': round(timestamp_s, 4),
+                        'frame_idx': frame_idx,
+                        'distance_m': 0.0,
+                    })
+                    print(f"[Processor] ★★★ HEIGHT MODE START at frame {frame_idx}, "
+                          f"t={timestamp_s:.2f}s, foot_x={foot_x:.0f}")
+
+                # FINISH: 전신 사라짐 (디바운스 + 최소 경과시간)
+                if self.timer_state == 'running' and not is_visible:
+                    self._invisible_count += 1
+                elif self.timer_state == 'running' and is_visible:
+                    self._invisible_count = 0  # 다시 보이면 리셋
+
+                elapsed_since_start = timestamp_s - self.timer_start_time_s if self.timer_state == 'running' else 0
+                finish_ready = (
+                    self.timer_state == 'running'
+                    and not is_visible
+                    and self._invisible_count >= 5  # 연속 5프레임 미감지
+                    and elapsed_since_start >= self._min_elapsed_s  # 최소 경과시간
                 )
 
-                if progress is not None:
-                    person['progress'] = round(progress, 4)
-                    dist_m = self.aruco.get_distance_from_start(progress)
-                    person['distance_from_start_m'] = round(dist_m, 3)
+                if finish_ready:
+                    self.finish_foot_x = self._last_visible_foot_x or foot_x
+                    self.timer_elapsed_s = timestamp_s - self.timer_start_time_s
+                    if self.start_foot_x is not None and self.finish_foot_x is not None:
+                        distance_m = abs(self.finish_foot_x - self.start_foot_x) / self.height_based_ppm
+                    else:
+                        distance_m = 0.0
+                    self._height_mode_distance = distance_m
+                    self.timer_state = 'finished'
+                    result['crossing_event'] = 'finish'
+                    self.crossing_events.append({
+                        'line': 'finish',
+                        'timestamp_s': round(timestamp_s, 4),
+                        'frame_idx': frame_idx,
+                        'elapsed_s': round(self.timer_elapsed_s, 3),
+                        'distance_m': round(distance_m, 3),
+                    })
+                    try:
+                        self._compute_results()
+                        result['results'] = self.analysis_results
+                    except Exception as e:
+                        import traceback
+                        print(f"[Processor] _compute_results error: {e}")
+                        traceback.print_exc()
+                        result['results'] = None
+                    print(f"[Processor] ★★★ HEIGHT MODE FINISH at frame {frame_idx}, "
+                          f"t={timestamp_s:.2f}s, distance={distance_m:.2f}m, "
+                          f"elapsed={self.timer_elapsed_s:.3f}s")
 
-                    # 디버그 로그
-                    self._debug_frame_count += 1
-                    if self._debug_frame_count <= 20 or self._debug_frame_count % 20 == 0:
-                        print(f"[Processor] frame={frame_idx} "
-                              f"foot_x={filtered_ground[0]:.0f} "
-                              f"progress={progress:.3f} dist={dist_m:.2f}m "
-                              f"timer={self.timer_state}")
+                # 전신 가시 상태 업데이트
+                if is_visible:
+                    self._last_visible_foot_x = foot_x
+                self.body_was_visible = is_visible
 
-                    # 라인 통과 감지 (진행률 기반)
-                    if self.prev_progress is not None:
-                        crossing = self.aruco.check_progress_crossing(
-                            self.prev_progress, progress
-                        )
-                        if crossing == 'start' and self.timer_state == 'standby':
-                            self.timer_state = 'running'
-                            self.timer_start_time_s = timestamp_s
-                            result['crossing_event'] = 'start'
-                            self.crossing_events.append({
-                                'line': 'start',
-                                'timestamp_s': round(timestamp_s, 4),
-                                'frame_idx': frame_idx,
-                                'distance_m': round(dist_m, 3),
-                            })
-                            print(f"[Processor] ★★★ START at frame {frame_idx}, "
-                                  f"t={timestamp_s:.2f}s, progress={progress:.3f}")
-                        elif crossing == 'finish' and self.timer_state == 'running':
-                            self.timer_elapsed_s = timestamp_s - self.timer_start_time_s
-                            self.timer_state = 'finished'
-                            result['crossing_event'] = 'finish'
-                            self.crossing_events.append({
-                                'line': 'finish',
-                                'timestamp_s': round(timestamp_s, 4),
-                                'frame_idx': frame_idx,
-                                'elapsed_s': round(self.timer_elapsed_s, 3),
-                                'distance_m': round(dist_m, 3),
-                            })
-                            try:
-                                self._compute_results()
-                                result['results'] = self.analysis_results
-                            except Exception as e:
-                                import traceback
-                                print(f"[Processor] _compute_results error: {e}")
-                                traceback.print_exc()
-                                result['results'] = None
-                            print(f"[Processor] ★★★ FINISH at frame {frame_idx}, "
-                                  f"t={timestamp_s:.2f}s, elapsed={self.timer_elapsed_s:.3f}s")
+                # 가상 progress (UI 표시용)
+                if self.virtual_start_x is not None and self.virtual_finish_x is not None:
+                    total_range = self.virtual_finish_x - self.virtual_start_x
+                    if abs(total_range) > 1:
+                        progress = (foot_x - self.virtual_start_x) / total_range
+                        progress = max(0.0, min(1.0, progress))
+                        person['progress'] = round(progress, 4)
+                        if self.height_based_ppm:
+                            dist_m = abs(foot_x - self.virtual_start_x) / self.height_based_ppm
+                            person['distance_from_start_m'] = round(dist_m, 3)
 
-                    self.prev_progress = progress
+                # 디버그 로그
+                self._debug_frame_count += 1
+                if self._debug_frame_count <= 20 or self._debug_frame_count % 20 == 0:
+                    print(f"[Processor] frame={frame_idx} "
+                          f"foot_x={foot_x:.0f} "
+                          f"visible={is_visible} "
+                          f"timer={self.timer_state}")
 
             result['person'] = person
 
@@ -442,36 +515,23 @@ class FrameProcessor:
             left_heel_x_sm, left_heel_y_sm = left_heel_x_raw, left_heel_y_raw
             right_heel_x_sm, right_heel_y_sm = right_heel_x_raw, right_heel_y_raw
 
-        # ═══ C. Homography vx 보정: 원근보정된 X좌표 (vx 비대칭 해소) ═══
-        # 원근 효과: 카메라에 가까운 발의 pixel vx가 과대 → L/R vx 비대칭
-        # Homography로 X좌표 보정 후 vx 계산 → 실세계 기준 대칭
-        if self.perspective_corrector.calibrated and self.perspective_corrector.H is not None:
-            _H = self.perspective_corrector.H
-            # Batch transform: ankle smooth X
-            pts_left = np.column_stack([left_x_smooth, left_y]).reshape(-1, 1, 2).astype(np.float32)
-            pts_right = np.column_stack([right_x_smooth, right_y]).reshape(-1, 1, 2).astype(np.float32)
-            left_x_corrected = cv2.perspectiveTransform(pts_left, _H)[:, 0, 0]
-            right_x_corrected = cv2.perspectiveTransform(pts_right, _H)[:, 0, 0]
-            # Batch transform: heel smooth X
-            pts_lheel = np.column_stack([left_heel_x_sm, left_y]).reshape(-1, 1, 2).astype(np.float32)
-            pts_rheel = np.column_stack([right_heel_x_sm, right_y]).reshape(-1, 1, 2).astype(np.float32)
-            left_heel_x_corrected = cv2.perspectiveTransform(pts_lheel, _H)[:, 0, 0]
-            right_heel_x_corrected = cv2.perspectiveTransform(pts_rheel, _H)[:, 0, 0]
-            print(f"[Processor] Homography vx correction: X coordinates perspective-corrected", flush=True)
-        else:
-            left_x_corrected = left_x_smooth
-            right_x_corrected = right_x_smooth
-            left_heel_x_corrected = left_heel_x_sm
-            right_heel_x_corrected = right_heel_x_sm
-
-        # ── HS Onset Ratio: valley→peak 구간에서 Initial Contact 위치 ──
-        # 1.0 = Y-peak 그대로 (loading response), 0.3 = IC에 가까움, 0.0 = valley
-        HS_ONSET_RATIO = 0.3
+        # X좌표 보정 없이 스무딩된 값 그대로 사용
+        # (동적 PPM이 거리 계산 시 원근보정 대체)
+        left_x_corrected = left_x_smooth
+        right_x_corrected = right_x_smooth
+        left_heel_x_corrected = left_heel_x_sm
+        right_heel_x_corrected = right_heel_x_sm
 
         def detect_heel_strikes(heel_x_smooth, heel_y_smooth, times_arr, min_dist, min_gap_s=0.25):
-            """적응형 Heel Strike 감지 - Y-peak onset (Initial Contact 시점)"""
+            """적응형 Heel Strike 감지 - Y-velocity 기반 IC 시점 감지
+
+            각 Y-peak마다:
+            1. valley→peak 구간에서 Y-velocity(vy) 계산
+            2. vy가 최대인 지점 = 발이 가장 빠르게 내려오는 순간 (IC 직전)
+            3. vy가 최대의 50%로 감소한 지점 = 발이 바닥에 닿으며 감속 (≈IC)
+            """
             if len(heel_y_smooth) < 5:
-                return []
+                return []  # returns list of (idx, interp_time) tuples
             y_range = np.max(heel_y_smooth) - np.min(heel_y_smooth)
             for prom_factor in [0.06, 0.03, 0.015]:
                 prom = max(1, y_range * prom_factor)
@@ -500,38 +560,86 @@ class FrameProcessor:
                         continue
                 final_peaks.append(idx)
 
-            # ── Onset detection: Y-peak → Initial Contact 보정 ──
-            if HS_ONSET_RATIO >= 1.0:
-                return final_peaks
+            # ── 적응형 IC 감지: Y-velocity 기반 ──
+            # Y-velocity = heel Y의 시간 미분 (양수 = 하강 중)
+            vy = np.gradient(heel_y_smooth, times_arr)
+            # 약간 스무딩 (노이즈 방지)
+            vy_sm = np.convolve(vy, np.ones(3) / 3, mode='same')
 
             onset_peaks = []
             total_shift_ms = 0
             for peak_idx in final_peaks:
-                # peak 이전 구간에서 valley (Y 최소) 찾기
                 search_start = max(0, peak_idx - int(min_dist * 2))
                 region = heel_y_smooth[search_start:peak_idx + 1]
-                if len(region) < 3:
-                    onset_peaks.append(peak_idx)
+                if len(region) < 5:
+                    onset_peaks.append((peak_idx, float(times_arr[peak_idx])))
                     continue
 
                 valley_local = int(np.argmin(region))
                 valley_idx = search_start + valley_local
 
-                # onset = valley + (peak - valley) * ratio
-                onset_idx = int(valley_idx + (peak_idx - valley_idx) * HS_ONSET_RATIO)
+                # valley→peak 구간의 vy
+                region_vy = vy_sm[valley_idx:peak_idx + 1]
+                if len(region_vy) < 3:
+                    onset_peaks.append((peak_idx, float(times_arr[peak_idx])))
+                    continue
+
+                # vy 최대 = 발이 가장 빠르게 내려오는 순간 (IC 직전)
+                max_vy_local = int(np.argmax(region_vy))
+                max_vy_val = region_vy[max_vy_local]
+
+                if max_vy_val <= 0:
+                    onset_peaks.append((peak_idx, float(times_arr[peak_idx])))
+                    total_shift_ms += 0
+                    continue
+
+                # vy가 최대의 40%로 감소한 지점 = IC (발이 바닥에 닿으며 감속)
+                # 서브프레임 보간: threshold crossing을 프레임 사이에서 정밀하게 잡음
+                threshold = max_vy_val * 0.4
+                ic_local = max_vy_local
+                interp_time = None
+                for j in range(max_vy_local + 1, len(region_vy)):
+                    if region_vy[j] < threshold:
+                        ic_local = j
+                        # j-1 (above threshold) ~ j (below threshold) 사이 선형 보간
+                        vy_above = region_vy[j - 1]
+                        vy_below = region_vy[j]
+                        denom = vy_above - vy_below
+                        if denom > 0:
+                            alpha = (vy_above - threshold) / denom
+                        else:
+                            alpha = 0.5
+                        idx_a = valley_idx + j - 1
+                        idx_b = valley_idx + j
+                        idx_a = max(0, min(idx_a, len(times_arr) - 1))
+                        idx_b = max(0, min(idx_b, len(times_arr) - 1))
+                        interp_time = times_arr[idx_a] + alpha * (times_arr[idx_b] - times_arr[idx_a])
+                        break
+
+                onset_idx = valley_idx + ic_local
                 onset_idx = max(valley_idx, min(onset_idx, peak_idx))
 
-                shift_ms = (times_arr[peak_idx] - times_arr[onset_idx]) * 1000
+                if interp_time is None:
+                    interp_time = times_arr[onset_idx]
+
+                shift_ms = (times_arr[peak_idx] - interp_time) * 1000
                 total_shift_ms += shift_ms
-                onset_peaks.append(onset_idx)
+                # (frame_idx, interpolated_time) 튜플로 반환
+                onset_peaks.append((onset_idx, float(interp_time)))
 
             avg_shift = total_shift_ms / len(onset_peaks) if onset_peaks else 0
-            print(f"[HS Onset] ratio={HS_ONSET_RATIO}, peaks={len(final_peaks)}, avg_shift={avg_shift:.0f}ms", flush=True)
+            print(f"[HS Onset] adaptive vy-based, peaks={len(final_peaks)}, avg_shift={avg_shift:.0f}ms", flush=True)
             return onset_peaks
 
+        # ── Vx-crossing HS refinement 모드 ──
+        # 'peak_decel': 최대 감속 시점 (Initial Contact에 가장 가까움)
+        # 'threshold': threshold crossing 시점 그대로 사용
+        # 'zero':      vx=0 까지 추적 (기존 방식, ~300ms 늦음)
+        VX_HS_MODE = 'peak_decel'
+
         def detect_hs_vx_crossing(heel_x_sm, times_arr, walk_sign, shared_threshold, min_gap_s=0.3):
-            """Ankle X velocity crossing 기반 HS 감지 (sub-frame 보간 포함)
-            Y-peak이 crosstalk으로 실패할 때 사용하는 fallback"""
+            """Ankle X velocity crossing 기반 HS 감지
+            VX_HS_MODE로 refinement 방식 선택"""
             if len(heel_x_sm) < 10:
                 return []
             vx_raw = np.gradient(heel_x_sm, times_arr)
@@ -545,27 +653,47 @@ class FrameProcessor:
                     crossings.append(i)
             eff_fps = len(times_arr) / (times_arr[-1] - times_arr[0]) if len(times_arr) > 1 else 20
             window = max(3, int(eff_fps * 0.2))
+
             refined = []
             for idx in crossings:
-                search_end = min(len(vx), idx + window)
-                zero_found = False
-                for j in range(idx, search_end):
-                    if vx[j] <= 0:
-                        if j > 0 and vx[j - 1] > 0:
-                            alpha = vx[j - 1] / (vx[j - 1] - vx[j])
-                            interp_time = times_arr[j - 1] + alpha * (times_arr[j] - times_arr[j - 1])
-                            refined.append((j, interp_time))
-                        else:
-                            refined.append((j, times_arr[j]))
-                        zero_found = True
-                        break
-                if not zero_found:
-                    local_abs_vx = np.abs(vx[idx:search_end])
-                    if len(local_abs_vx) > 0:
-                        best = idx + int(np.argmin(local_abs_vx))
-                        refined.append((best, times_arr[best]))
+                if VX_HS_MODE == 'peak_decel':
+                    # 최대 감속 시점: threshold crossing 전후 구간에서
+                    # 가속도(dvx/dt)가 가장 음수인 지점 = 발이 가장 급격히 감속하는 순간
+                    search_start = max(0, idx - window)
+                    search_end = min(len(vx), idx + window // 2)
+                    ax = np.gradient(vx[search_start:search_end])
+                    if len(ax) > 0:
+                        peak_decel_local = int(np.argmin(ax))  # 가장 큰 음의 가속도
+                        best_idx = search_start + peak_decel_local
+                        refined.append((best_idx, times_arr[best_idx]))
                     else:
                         refined.append((idx, times_arr[idx]))
+
+                elif VX_HS_MODE == 'threshold':
+                    # threshold crossing 시점 그대로
+                    refined.append((idx, times_arr[idx]))
+
+                else:  # 'zero' - 기존 방식
+                    search_end = min(len(vx), idx + window)
+                    zero_found = False
+                    for j in range(idx, search_end):
+                        if vx[j] <= 0:
+                            if j > 0 and vx[j - 1] > 0:
+                                alpha = vx[j - 1] / (vx[j - 1] - vx[j])
+                                interp_time = times_arr[j - 1] + alpha * (times_arr[j] - times_arr[j - 1])
+                                refined.append((j, interp_time))
+                            else:
+                                refined.append((j, times_arr[j]))
+                            zero_found = True
+                            break
+                    if not zero_found:
+                        local_abs_vx = np.abs(vx[idx:search_end])
+                        if len(local_abs_vx) > 0:
+                            best = idx + int(np.argmin(local_abs_vx))
+                            refined.append((best, times_arr[best]))
+                        else:
+                            refined.append((idx, times_arr[idx]))
+
             filtered = []
             for frame_idx, interp_t in refined:
                 if filtered:
@@ -721,7 +849,7 @@ class FrameProcessor:
             right_hs = detect_heel_strikes(right_heel_x_sm, right_heel_y_sm, times, min_distance)
             print(f"[Processor] Y-peak HS detection: L={len(left_hs)}, R={len(right_hs)}", flush=True)
 
-            ypeak_events = build_step_events_from_indices(left_hs, right_hs)
+            ypeak_events = build_step_events_from_indices(left_hs, right_hs, use_interp_time=True)
             ypeak_cadence = (len(ypeak_events) / elapsed) * 60 if len(ypeak_events) >= 2 else 0
             print(f"[Processor] Y-peak result: {len(ypeak_events)} events, cadence={ypeak_cadence:.0f} spm", flush=True)
 
@@ -848,9 +976,29 @@ class FrameProcessor:
             return result
 
         # ═══ 기본 보행 지표 계산 ═══
-        distance_m = self.aruco.marker_distance_m
-        ppm = self.aruco.pixels_per_meter if self.aruco.pixels_per_meter else 100
-        print(f"[Processor] Homography calibrated: {self.perspective_corrector.calibrated}", flush=True)
+        distance_m = self._height_mode_distance if self._height_mode_distance else self.walk_distance_m
+        ppm = self._get_effective_ppm() or 100
+
+        # ── 동적 PPM (원근보정) ──
+        # 매 프레임의 키 픽셀 높이로 위치별 ppm 계산
+        # 카메라에 가까울수록 키가 크게 보임 → ppm 높음 → 자동 원근보정
+        _height_px_by_frame = {}
+        if self.patient_height_m:
+            for h in segment:
+                if 'height_px' in h:
+                    _height_px_by_frame[h['frame_idx']] = h['height_px']
+            if _height_px_by_frame:
+                print(f"[Processor] Dynamic PPM: {len(_height_px_by_frame)} height samples for perspective correction", flush=True)
+
+        def get_local_ppm(frame_idx):
+            """위치별 동적 ppm 반환. 해당 프레임에 height_px 없으면 글로벌 ppm 폴백."""
+            if _height_px_by_frame and self.patient_height_m:
+                h_px = _height_px_by_frame.get(frame_idx)
+                if h_px:
+                    return h_px / self.patient_height_m
+            return ppm
+
+        print(f"[Processor] ppm: {ppm:.1f}, dynamic_ppm_samples: {len(_height_px_by_frame)}", flush=True)
 
         # 케이던스 (steps per minute) - 중앙값 기반 (이상치 강건)
         cadence = (step_count / elapsed) * 60  # 기본 계산
@@ -865,12 +1013,11 @@ class FrameProcessor:
         if 30 <= cadence <= 200:
             result['cadence_spm'] = round(cadence, 1)
 
-        # 평균 보폭 (step length) - 연속된 step 사이 거리
+        # 평균 보폭/활보장은 L/R 계산 후 평균으로 설정 (아래에서 덮어씀)
+        # fallback: 총거리 / 스텝수
         step_length = distance_m / step_count if step_count > 0 else None
         if step_length and 0.2 <= step_length <= 1.5:
             result['step_length_m'] = round(step_length, 3)
-
-        # 활보장 (stride length) - 같은 발 2회 = 2 steps
         stride_count = step_count // 2
         stride_length = distance_m / stride_count if stride_count > 0 else None
         if stride_length and 0.4 <= stride_length <= 2.5:
@@ -895,10 +1042,9 @@ class FrameProcessor:
                 x2 = (next2['left_x'] + next2['right_x']) / 2
                 y2 = (next2['left_y'] + next2['right_y']) / 2
                 dx = abs(x2 - x1)
-                if self.perspective_corrector.calibrated:
-                    stride_m = self.perspective_corrector.real_distance_x(x1, y1, x2, y2)
-                else:
-                    stride_m = dx / ppm
+                # 동적 PPM: 두 위치의 평균 local ppm 사용 (원근보정)
+                lp = (get_local_ppm(curr['frame_idx']) + get_local_ppm(next2['frame_idx'])) / 2
+                stride_m = dx / lp
 
                 if 0.3 <= stride_m <= 4.0:
                     if i % 2 == 0:
@@ -986,11 +1132,9 @@ class FrameProcessor:
                     curr_mid_y = (curr['left_y'] + curr['right_y']) / 2
                     prev_mid_y = (prev['left_y'] + prev['right_y']) / 2
                     dx = abs(curr_mid_x - prev_mid_x)
-                    if self.perspective_corrector.calibrated:
-                        step_m = self.perspective_corrector.real_distance_x(
-                            prev_mid_x, prev_mid_y, curr_mid_x, curr_mid_y)
-                    else:
-                        step_m = dx / ppm
+                    # 동적 PPM: 두 위치의 평균 local ppm 사용
+                    lp = (get_local_ppm(curr['frame_idx']) + get_local_ppm(prev['frame_idx'])) / 2
+                    step_m = dx / lp
                     if 0.2 <= step_m <= 2.0:
                         if curr['leading_foot'] == 'left':
                             left_step_dists.append(step_m)
@@ -1162,6 +1306,25 @@ class FrameProcessor:
             print(f"[Processor] Swing/Stance analysis error: {e}", flush=True)
             traceback.print_exc()
 
+        # ═══ 통합 step/stride를 L/R 평균으로 덮어쓰기 (거리 일관성) ═══
+        l_step = result.get('left_step_length_m')
+        r_step = result.get('right_step_length_m')
+        if l_step and r_step:
+            result['step_length_m'] = round((l_step + r_step) / 2, 3)
+        elif l_step:
+            result['step_length_m'] = l_step
+        elif r_step:
+            result['step_length_m'] = r_step
+
+        l_stride = result.get('left_stride_length_m')
+        r_stride = result.get('right_stride_length_m')
+        if l_stride and r_stride:
+            result['stride_length_m'] = round((l_stride + r_stride) / 2, 3)
+        elif l_stride:
+            result['stride_length_m'] = l_stride
+        elif r_stride:
+            result['stride_length_m'] = r_stride
+
         # ═══ 종합 대칭성 지수 (모든 SI의 평균) ═══
         if si_values:
             result['overall_symmetry_index'] = round(np.mean(si_values), 1)
@@ -1173,7 +1336,7 @@ class FrameProcessor:
         if self.timer_elapsed_s <= 0:
             return
 
-        distance_m = self.aruco.marker_distance_m
+        distance_m = self._height_mode_distance if self._height_mode_distance else self.walk_distance_m
         speed_mps = distance_m / self.timer_elapsed_s
 
         # 상세 보행 분석
@@ -1187,7 +1350,7 @@ class FrameProcessor:
 
         # 임상 해석
         if self.gait_analyzer is None:
-            self.calibrator.pixels_per_meter = self.aruco.pixels_per_meter
+            self.calibrator.pixels_per_meter = self._get_effective_ppm() or 100
             self.gait_analyzer = GaitAnalyzer(self.calibrator)
 
         interpretation = self.gait_analyzer.get_clinical_interpretation(
@@ -1259,6 +1422,8 @@ class FrameProcessor:
             # 임상 해석
             'clinical': interpretation,
             'analysis_mode': 'lateral',
+            'height_based_ppm': self.height_based_ppm,
+            'actual_distance_m': distance_m,
         }
 
         # ═══ 판정 로직 ═══
@@ -1303,6 +1468,21 @@ class FrameProcessor:
 
         evidence_clips = {}
 
+        # 동적 PPM lookup (evidence clips에서도 사용)
+        ppm_ev = self._get_effective_ppm() or 100
+        _hpx_by_frame_ev = {}
+        if self.patient_height_m:
+            for h in self.ankle_history:
+                if 'height_px' in h:
+                    _hpx_by_frame_ev[h['frame_idx']] = h['height_px']
+
+        def _ev_local_ppm(frame_idx):
+            if _hpx_by_frame_ev and self.patient_height_m:
+                h_px = _hpx_by_frame_ev.get(frame_idx)
+                if h_px:
+                    return h_px / self.patient_height_m
+            return ppm_ev
+
         # 보행속도 / 케이던스 → 전체 구간
         evidence_clips['gait_velocity_ms'] = {
             'start_s': round(start_t, 2), 'end_s': round(finish_t, 2),
@@ -1310,65 +1490,127 @@ class FrameProcessor:
         }
         evidence_clips['cadence_spm'] = evidence_clips['gait_velocity_ms']
 
-        # 보폭 / 활보장 → 전체 step_events 기준으로 앵커 HS ~ 타겟 HS 포함
+        # 보폭 / 활보장 → 평균에 가장 가까운 대표 스텝 선택
         for foot in ['left', 'right']:
             foot_steps = [e for e in step_events if e.get('leading_foot') == foot]
-            if len(foot_steps) >= 2:
-                # Step: 타겟 HS 기준, 바로 이전 HS(반대발)부터 포함
-                mid_idx = len(foot_steps) // 2
-                target_event = foot_steps[mid_idx]
-                target_all_idx = step_events.index(target_event)
-                # 앵커 = 전체 step_events에서 1칸 전 (반대발 HS)
-                anchor_idx = max(0, target_all_idx - 1)
-                anchor_event = step_events[anchor_idx]
-                clip = {
-                    'start_s': round(anchor_event['time'] - 0.4, 2),
-                    'end_s': round(target_event['time'] + 0.4, 2),
-                    'label': f'{foot} step',
-                }
-                evidence_clips[f'{foot}_step_length_cm'] = clip
-            if len(foot_steps) >= 3:
-                # Stride: 같은 발 HS → 반대발 HS → 같은 발 HS (2칸 전부터)
-                mid_idx = len(foot_steps) // 2
-                target_event = foot_steps[min(mid_idx + 1, len(foot_steps) - 1)]
-                target_all_idx = step_events.index(target_event)
-                # 앵커 = 전체 step_events에서 2칸 전 (같은 발 이전 HS)
-                anchor_idx = max(0, target_all_idx - 2)
-                anchor_event = step_events[anchor_idx]
-                clip = {
-                    'start_s': round(anchor_event['time'] - 0.4, 2),
-                    'end_s': round(target_event['time'] + 0.4, 2),
-                    'label': f'{foot} stride',
-                }
-                evidence_clips[f'{foot}_stride_length_cm'] = clip
+            avg_step_cm = left_step_cm if foot == 'left' else right_step_cm
+            avg_stride_cm = left_stride_cm if foot == 'left' else right_stride_cm
 
-        # step_time / stride_time → L/R 별도 (distance와 동일 HS 구간)
+            if len(foot_steps) >= 2 and avg_step_cm:
+                # 각 foot_step의 개별 step_length 계산 → 평균에 가장 가까운 것 선택
+                best_target = None
+                best_diff = float('inf')
+                for fs in foot_steps:
+                    fs_all_idx = step_events.index(fs)
+                    if fs_all_idx < 1:
+                        continue
+                    prev = step_events[fs_all_idx - 1]
+                    curr_mid = (fs['left_x'] + fs['right_x']) / 2
+                    prev_mid = (prev['left_x'] + prev['right_x']) / 2
+                    dx = abs(curr_mid - prev_mid)
+                    lp = (_ev_local_ppm(fs['frame_idx']) + _ev_local_ppm(prev['frame_idx'])) / 2
+                    step_cm = (dx / lp) * 100
+                    diff = abs(step_cm - avg_step_cm)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_target = fs
+
+                if best_target:
+                    target_all_idx = step_events.index(best_target)
+                    anchor_idx = max(0, target_all_idx - 1)
+                    anchor_event = step_events[anchor_idx]
+                    evidence_clips[f'{foot}_step_length_cm'] = {
+                        'start_s': round(anchor_event['time'] - 0.4, 2),
+                        'end_s': round(best_target['time'] + 0.4, 2),
+                        'label': f'{foot} step',
+                        'target_step_num': target_all_idx + 1,
+                    }
+
+            if len(foot_steps) >= 3 and avg_stride_cm:
+                # Stride: 같은 발 event[i-2]→event[i] 거리 → 평균에 가장 가까운 것 선택
+                best_target = None
+                best_diff = float('inf')
+                for fs in foot_steps:
+                    fs_all_idx = step_events.index(fs)
+                    if fs_all_idx < 2:
+                        continue
+                    prev2 = step_events[fs_all_idx - 2]
+                    foot_key = 'left_x' if foot == 'left' else 'right_x'
+                    dx = abs(fs[foot_key] - prev2[foot_key])
+                    lp = (_ev_local_ppm(fs['frame_idx']) + _ev_local_ppm(prev2['frame_idx'])) / 2
+                    stride_cm = (dx / lp) * 100
+                    diff = abs(stride_cm - avg_stride_cm)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_target = fs
+                        best_anchor = prev2
+
+                if best_target:
+                    evidence_clips[f'{foot}_stride_length_cm'] = {
+                        'start_s': round(best_anchor['time'] - 0.4, 2),
+                        'end_s': round(best_target['time'] + 0.4, 2),
+                        'label': f'{foot} stride',
+                        'target_step_num': step_events.index(best_target) + 1,
+                    }
+
+        # step_time / stride_time → 평균에 가장 가까운 대표 스텝 선택
+        avg_step_time = {
+            'left': gait_params.get('left_step_time_s'),
+            'right': gait_params.get('right_step_time_s'),
+        }
+        avg_stride_time = {
+            'left': gait_params.get('left_stride_time_s'),
+            'right': gait_params.get('right_stride_time_s'),
+        }
         for foot in ['left', 'right']:
             foot_steps = [e for e in step_events if e.get('leading_foot') == foot]
-            if len(foot_steps) >= 2:
-                # Step time: 반대발 HS → 이 발 HS (distance step과 동일 구간)
-                mid_idx = len(foot_steps) // 2
-                target_event = foot_steps[mid_idx]
-                target_all_idx = step_events.index(target_event)
-                anchor_idx = max(0, target_all_idx - 1)
-                anchor_event = step_events[anchor_idx]
-                evidence_clips[f'{foot}_step_time_s'] = {
-                    'start_s': round(anchor_event['time'] - 0.4, 2),
-                    'end_s': round(target_event['time'] + 0.4, 2),
-                    'label': f'{foot} step time',
-                }
-            if len(foot_steps) >= 3:
-                # Stride time: 같은 발 HS → 같은 발 HS (distance stride와 동일 구간)
-                mid_idx = len(foot_steps) // 2
-                target_event = foot_steps[min(mid_idx + 1, len(foot_steps) - 1)]
-                target_all_idx = step_events.index(target_event)
-                anchor_idx = max(0, target_all_idx - 2)
-                anchor_event = step_events[anchor_idx]
-                evidence_clips[f'{foot}_stride_time_s'] = {
-                    'start_s': round(anchor_event['time'] - 0.4, 2),
-                    'end_s': round(target_event['time'] + 0.4, 2),
-                    'label': f'{foot} stride time',
-                }
+            if len(foot_steps) >= 2 and avg_step_time[foot]:
+                best_target = None
+                best_diff = float('inf')
+                for fs in foot_steps:
+                    fs_all_idx = step_events.index(fs)
+                    if fs_all_idx < 1:
+                        continue
+                    prev = step_events[fs_all_idx - 1]
+                    dt = fs['time'] - prev['time']
+                    if 0.2 <= dt <= 2.0:
+                        diff = abs(dt - avg_step_time[foot])
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_target = fs
+                            best_anchor = prev
+
+                if best_target:
+                    evidence_clips[f'{foot}_step_time_s'] = {
+                        'start_s': round(best_anchor['time'] - 0.4, 2),
+                        'end_s': round(best_target['time'] + 0.4, 2),
+                        'label': f'{foot} step time',
+                        'target_step_num': step_events.index(best_target) + 1,
+                    }
+
+            if len(foot_steps) >= 3 and avg_stride_time[foot]:
+                best_target = None
+                best_diff = float('inf')
+                for fs in foot_steps:
+                    fs_all_idx = step_events.index(fs)
+                    if fs_all_idx < 2:
+                        continue
+                    prev2 = step_events[fs_all_idx - 2]
+                    dt = fs['time'] - prev2['time']
+                    if 0.4 <= dt <= 4.0:
+                        diff = abs(dt - avg_stride_time[foot])
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_target = fs
+                            best_anchor = prev2
+
+                if best_target:
+                    evidence_clips[f'{foot}_stride_time_s'] = {
+                        'start_s': round(best_anchor['time'] - 0.4, 2),
+                        'end_s': round(best_target['time'] + 0.4, 2),
+                        'label': f'{foot} stride time',
+                        'target_step_num': step_events.index(best_target) + 1,
+                    }
 
         # stance / swing → 보행 중반부
         mid_t = (start_t + finish_t) / 2
@@ -1382,7 +1624,21 @@ class FrameProcessor:
 
         # ═══ Analysis Timeline (프레임별 오버레이 데이터) ═══
         # 프론트엔드에서 영상 위에 실시간 오버레이를 그리기 위한 데이터
-        ppm = self.aruco.pixels_per_meter if self.aruco.pixels_per_meter else 100
+        ppm = self._get_effective_ppm() or 100
+
+        # 동적 PPM lookup (원근보정)
+        _hpx_by_frame = {}
+        if self.patient_height_m:
+            for h in self.ankle_history:
+                if 'height_px' in h:
+                    _hpx_by_frame[h['frame_idx']] = h['height_px']
+
+        def _local_ppm(frame_idx):
+            if _hpx_by_frame and self.patient_height_m:
+                h_px = _hpx_by_frame.get(frame_idx)
+                if h_px:
+                    return h_px / self.patient_height_m
+            return ppm
 
         # step_events에 개별 거리(cm) 추가
         raw_steps = gait_params['step_events']
@@ -1390,28 +1646,45 @@ class FrameProcessor:
         for i, ev in enumerate(raw_steps):
             entry = dict(ev)  # copy
             entry['step_num'] = i + 1
-            # 이전 스텝과의 거리 = step length
+            # 이전 스텝과의 거리 = step length (반드시 다른 발이어야 step)
             if i > 0:
                 prev = raw_steps[i - 1]
-                # 두 발의 중점 X 변화
-                curr_mid = (ev['left_x'] + ev['right_x']) / 2
-                prev_mid = (prev['left_x'] + prev['right_x']) / 2
-                dx = abs(curr_mid - prev_mid)
-                step_cm = (dx / ppm) * 100
-                entry['step_length_cm'] = round(float(step_cm), 1)
-                entry['step_time_s'] = round(float(ev['time'] - prev['time']), 3)
+                dt = ev['time'] - prev['time']
+                if ev.get('leading_foot') != prev.get('leading_foot') and 0.2 <= dt <= 2.0:
+                    curr_mid = (ev['left_x'] + ev['right_x']) / 2
+                    prev_mid = (prev['left_x'] + prev['right_x']) / 2
+                    dx = abs(curr_mid - prev_mid)
+                    lp = (_local_ppm(ev['frame_idx']) + _local_ppm(prev['frame_idx'])) / 2
+                    step_cm = (dx / lp) * 100
+                    if 10 <= step_cm <= 200:  # 합리적 범위 필터
+                        entry['step_length_cm'] = round(float(step_cm), 1)
+                    else:
+                        entry['step_length_cm'] = None
+                    entry['step_time_s'] = round(float(dt), 3)
+                else:
+                    entry['step_length_cm'] = None
+                    entry['step_time_s'] = None
             else:
                 entry['step_length_cm'] = None
                 entry['step_time_s'] = None
-            # 같은 발 2칸 전 = stride
+            # 같은 발 2칸 전 = stride (midpoint 기준 — 평균 계산과 동일)
             if i >= 2 and raw_steps[i - 2].get('leading_foot') == ev.get('leading_foot'):
                 prev2 = raw_steps[i - 2]
-                foot_key = 'left_x' if ev['leading_foot'] == 'left' else 'right_x'
-                dx2 = abs(ev[foot_key] - prev2[foot_key])
-                stride_cm = (dx2 / ppm) * 100
-                entry['stride_length_cm'] = round(float(stride_cm), 1)
+                curr_mid2 = (ev['left_x'] + ev['right_x']) / 2
+                prev_mid2 = (prev2['left_x'] + prev2['right_x']) / 2
+                dx2 = abs(curr_mid2 - prev_mid2)
+                lp2 = (_local_ppm(ev['frame_idx']) + _local_ppm(prev2['frame_idx'])) / 2
+                stride_cm = (dx2 / lp2) * 100
+                dt2 = ev['time'] - prev2['time']
+                if 30 <= stride_cm <= 400 and 0.4 <= dt2 <= 4.0:
+                    entry['stride_length_cm'] = round(float(stride_cm), 1)
+                    entry['stride_time_s'] = round(float(dt2), 3)
+                else:
+                    entry['stride_length_cm'] = None
+                    entry['stride_time_s'] = None
             else:
                 entry['stride_length_cm'] = None
+                entry['stride_time_s'] = None
             enriched_steps.append(entry)
 
         self.analysis_results['step_events'] = enriched_steps
@@ -1437,7 +1710,8 @@ class FrameProcessor:
                 mid_x = (h['left_x'] + h['right_x']) / 2
                 first_h = segment[0]
                 first_mid_x = (first_h['left_x'] + first_h['right_x']) / 2
-                dist_so_far = abs(mid_x - first_mid_x) / ppm
+                local_p = _local_ppm(h['frame_idx'])
+                dist_so_far = abs(mid_x - first_mid_x) / local_p
                 inst_speed = dist_so_far / elapsed_from_start
             else:
                 inst_speed = 0

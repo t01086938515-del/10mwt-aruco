@@ -23,6 +23,7 @@ export interface AIAnalysisState {
 
   // 연결 정보
   videoId: string | null;
+  fileName: string | null;
   isConnected: boolean;
 
   // 보정 데이터
@@ -48,6 +49,7 @@ const initialState: AIAnalysisState = {
   status: "idle",
   error: null,
   videoId: null,
+  fileName: null,
   isConnected: false,
   calibration: null,
   currentFrame: null,
@@ -81,6 +83,10 @@ const aiAnalysisSlice = createSlice({
     // 연결 관리
     setVideoId: (state, action: PayloadAction<string>) => {
       state.videoId = action.payload;
+    },
+
+    setFileName: (state, action: PayloadAction<string>) => {
+      state.fileName = action.payload;
     },
 
     setConnected: (state, action: PayloadAction<boolean>) => {
@@ -155,6 +161,7 @@ export const {
   setStatus,
   setError,
   setVideoId,
+  setFileName,
   setConnected,
   setCalibration,
   updateFrame,

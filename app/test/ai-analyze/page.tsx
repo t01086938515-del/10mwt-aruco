@@ -75,7 +75,7 @@ export default function AIAnalyzePage() {
   const getStatusBadge = () => {
     switch (status) {
       case "calibrating":
-        return <Badge className="bg-yellow-500">마커 보정 중</Badge>;
+        return <Badge className="bg-yellow-500">키 보정 중</Badge>;
       case "analyzing":
         return <Badge className="bg-blue-500">분석 중</Badge>;
       case "error":
@@ -184,7 +184,7 @@ export default function AIAnalyzePage() {
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-lg">
               <Target className="h-5 w-5" />
-              ArUco 마커 보정
+              키 기반 보정
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -196,31 +196,21 @@ export default function AIAnalyzePage() {
                 </div>
                 <div className="grid grid-cols-2 gap-4 text-sm">
                   <div className="rounded-lg bg-gray-100 p-3">
-                    <p className="text-gray-500">감지된 마커</p>
-                    <p className="text-lg font-bold">{calibration.stored_markers?.length || 0}개</p>
-                  </div>
-                  <div className="rounded-lg bg-gray-100 p-3">
-                    <p className="text-gray-500">측정 거리</p>
-                    <p className="text-lg font-bold">{calibration.marker_distance_m?.toFixed(2) || "-"}m</p>
-                  </div>
-                  <div className="rounded-lg bg-gray-100 p-3">
                     <p className="text-gray-500">해상도</p>
                     <p className="text-lg font-bold">
                       {calibration.pixels_per_meter?.toFixed(0) || "-"} px/m
                     </p>
                   </div>
                   <div className="rounded-lg bg-gray-100 p-3">
-                    <p className="text-gray-500">측정 구간</p>
-                    <p className="text-lg font-bold">
-                      {calibration.start_x ? Math.round(calibration.start_x) : "-"} - {calibration.finish_x ? Math.round(calibration.finish_x) : "-"} px
-                    </p>
+                    <p className="text-gray-500">측정 거리</p>
+                    <p className="text-lg font-bold">{calibration.marker_distance_m?.toFixed(2) || "-"}m</p>
                   </div>
                 </div>
               </div>
             ) : status === "calibrating" ? (
               <div className="flex items-center gap-3 text-yellow-600">
                 <Loader2 className="h-5 w-5 animate-spin" />
-                <span>마커를 찾는 중...</span>
+                <span>환자 키로 보정 중...</span>
               </div>
             ) : (
               <div className="flex items-center gap-3 text-gray-500">
@@ -258,9 +248,13 @@ export default function AIAnalyzePage() {
                 </p>
               </div>
               <div className="rounded-lg bg-gray-100 p-3 text-center">
-                <p className="text-xs text-gray-500">감지 마커</p>
+                <p className="text-xs text-gray-500">보정 상태</p>
                 <p className="text-xl font-bold">
-                  {currentFrame?.num_markers ?? "-"}
+                  {calibration?.calibrated ? (
+                    <span className="text-green-600">완료</span>
+                  ) : (
+                    <span className="text-gray-400">대기</span>
+                  )}
                 </p>
               </div>
             </div>

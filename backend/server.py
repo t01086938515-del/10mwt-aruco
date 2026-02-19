@@ -172,7 +172,7 @@ async def websocket_analyze(websocket: WebSocket, video_id: str):
     """양방향 분석 WebSocket
 
     Client → Server 메시지:
-        { "type": "configure", "marker_size": 0.2, "start_id": 0, "finish_id": 1, "distance": 10.0 }
+        { "type": "configure", "distance": 10.0, "patient_height_m": 1.7 }
         { "type": "start_analysis" }
         { "type": "pause" }
         { "type": "reset" }
@@ -197,10 +197,8 @@ async def websocket_analyze(websocket: WebSocket, video_id: str):
 
     # 기본 설정
     config = {
-        "marker_size": 0.2,
-        "start_id": 0,
-        "finish_id": 1,
         "distance": 10.0,
+        "patient_height_m": None,
     }
 
     processor: Optional[FrameProcessor] = None
@@ -234,10 +232,8 @@ async def websocket_analyze(websocket: WebSocket, video_id: str):
                 msg_type = msg.get("type", "")
 
                 if msg_type == "configure":
-                    config["marker_size"] = msg.get("marker_size", 0.2)
-                    config["start_id"] = msg.get("start_id", 0)
-                    config["finish_id"] = msg.get("finish_id", 1)
                     config["distance"] = msg.get("distance", 10.0)
+                    config["patient_height_m"] = msg.get("patient_height_m")
                     await websocket.send_json({
                         "type": "configured",
                         "config": config,
@@ -247,10 +243,8 @@ async def websocket_analyze(websocket: WebSocket, video_id: str):
                     model_path = find_model_path()
                     processor = FrameProcessor(
                         model_path=model_path,
-                        marker_size_m=config["marker_size"],
-                        start_marker_id=config["start_id"],
-                        finish_marker_id=config["finish_id"],
-                        marker_distance_m=config["distance"],
+                        walk_distance_m=config["distance"],
+                        patient_height_m=config.get("patient_height_m"),
                     )
                     analyzing = True
                     paused = False
@@ -292,7 +286,7 @@ async def _run_analysis(
 ):
     """2-pass 비동기 배치 분석 실행
 
-    Pass 1: ArUco 마커만 빠르게 스캔하여 보정 완료
+    Pass 1: 키 기반 캘리브레이션 (사람 키 픽셀 샘플링)
     Pass 2: 보정 완료 상태에서 프레임 0부터 사람 감지 + 진행률 계산
     """
     import time as _time
@@ -301,18 +295,16 @@ async def _run_analysis(
     fps = reader.fps
     total_frames = reader.total_frames
 
-    processor.aruco.set_camera_params(reader.width, reader.height)
     processor.set_fps(fps)
 
     frame_skip = 3 if fps > 45 else 2  # 60fps → 20fps, 30fps → 15fps
-    # Pass 1에서는 더 큰 간격으로 스캔 (마커만 찾으면 됨)
-    marker_scan_skip = 10 if fps > 45 else 5
+    height_scan_skip = 10 if fps > 45 else 5
 
     print(f"[Analysis] Starting 2-pass: {total_frames} frames, {fps:.1f}fps")
 
     analysis_start = _time.time()
 
-    # ═══ PASS 1: ArUco 마커 스캔 (보정 완료까지) ═══
+    # ═══ PASS 1: 키 기반 캘리브레이션 (사람 키 픽셀 샘플링) ═══
     await websocket.send_json({
         "type": "progress",
         "frame_idx": 0,
@@ -320,21 +312,38 @@ async def _run_analysis(
         "percent": 0,
         "phase": "calibration_scan",
     })
-    print(f"[Analysis] Pass 1: Scanning for ArUco markers...")
+
+    if not processor.patient_height_m:
+        print(f"[Analysis] Pass 1: No patient height - calibration impossible")
+        await websocket.send_json({
+            "type": "error",
+            "message": "환자 키 정보가 없습니다. 환자 프로필에 키(cm)를 입력하세요.",
+        })
+        reader.release()
+        return
+
+    print(f"[Analysis] Pass 1: Sampling person height (patient={processor.patient_height_m:.2f}m)...")
 
     try:
         for frame_idx, frame in reader.frames():
-            if frame_idx % marker_scan_skip != 0:
+            if frame_idx % height_scan_skip != 0:
                 continue
 
-            processor.aruco.detect_markers(frame)
-            if processor.aruco.try_calibrate():
-                print(f"[Analysis] Pass 1: Calibration done at frame {frame_idx}")
+            pose_result = processor.pose_detector.detect(frame)
+            tracks = pose_result['tracks']
+            if tracks and tracks[0].get('keypoints'):
+                height_px = processor._sample_person_height(tracks[0]['keypoints'])
+                if height_px is not None:
+                    processor.height_samples.append(height_px)
+
+            # 샘플 충분하면 조기 종료
+            if len(processor.height_samples) >= 30:
+                print(f"[Analysis] Pass 1: Enough samples ({len(processor.height_samples)}) at frame {frame_idx}")
                 break
 
-            # 진행률 업데이트 (10% 단위)
-            if frame_idx % (marker_scan_skip * 20) == 0:
-                percent = round(frame_idx / total_frames * 50, 1)  # Pass 1은 0~50%
+            # 진행률 업데이트
+            if frame_idx % (height_scan_skip * 20) == 0:
+                percent = round(frame_idx / total_frames * 50, 1)
                 await websocket.send_json({
                     "type": "progress",
                     "frame_idx": frame_idx,
@@ -350,18 +359,22 @@ async def _run_analysis(
     finally:
         reader.release()
 
-    if not processor.aruco.calibrated:
-        print(f"[Analysis] Pass 1: Calibration FAILED - no markers found")
+    # 캘리브레이션 시도
+    if not processor.try_calibrate_with_height():
+        print(f"[Analysis] Pass 1: Calibration FAILED (samples={len(processor.height_samples)})")
         await websocket.send_json({
             "type": "error",
-            "message": "ArUco 마커를 찾을 수 없습니다. 영상에 시작/끝 마커가 보이는지 확인하세요.",
+            "message": "키 기반 보정에 실패했습니다. 영상에 전신이 보이는지 확인하세요.",
         })
         return
 
     # 보정 정보 전송
     await websocket.send_json({
         "type": "calibration",
-        **processor.aruco.get_calibration_info(),
+        "calibrated": True,
+        "height_based_ppm": processor.height_based_ppm,
+        "patient_height_m": processor.patient_height_m,
+        "height_samples": len(processor.height_samples),
     })
 
     pass1_time = _time.time() - analysis_start
@@ -424,13 +437,10 @@ async def _run_analysis(
                                 color = (255, 100, 100) if idx % 2 == 1 else (100, 100, 255)  # R=blue, L=red
                                 cv2.circle(annotated, (int(kps[idx][0]), int(kps[idx][1])), 6, color, -1)
 
-                # ArUco 마커 라인 그리기
-                if processor.aruco.calibrated:
-                    cal = processor.aruco.get_calibration_info()
-                    sx = int(cal.get('start_x', 0))
-                    fx = int(cal.get('finish_x', 0))
-                    cv2.line(annotated, (sx, 0), (sx, frame.shape[0]), (0, 255, 0), 2)
-                    cv2.line(annotated, (fx, 0), (fx, frame.shape[0]), (0, 0, 255), 2)
+                # PPM 표시
+                if processor.height_based_ppm:
+                    cv2.putText(annotated, f"PPM: {processor.height_based_ppm:.0f}", (50, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 200, 0), 2)
 
                 # 타이머 표시
                 timer_state = frame_data.get('timer', {}).get('state', '')

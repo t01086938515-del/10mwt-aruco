@@ -4,7 +4,7 @@
  */
 
 export type WSMessageType =
-  | 'calibration'      // ArUco 마커 보정 완료
+  | 'calibration'      // 키 기반 보정 완료
   | 'frame_data'       // 프레임별 분석 데이터
   | 'crossing_event'   // 라인 통과 이벤트
   | 'analysis_complete' // 분석 완료
@@ -13,17 +13,10 @@ export type WSMessageType =
 
 export interface CalibrationData {
   calibrated: boolean;
-  marker_size_m: number;
-  marker_distance_m: number;  // 측정 거리
-  start_marker_id: number;
-  finish_marker_id: number;
   pixels_per_meter: number;
-  start_center_px: [number, number] | null;
-  finish_center_px: [number, number] | null;
-  stored_markers: number[];
+  marker_distance_m: number;  // 측정 거리 (walk_distance_m)
   analysis_mode: string;
-  start_x: number | null;
-  finish_x: number | null;
+  patient_height_m?: number;
 }
 
 export interface KeypointData {
@@ -35,8 +28,6 @@ export interface KeypointData {
 export interface FrameData {
   frame_idx: number;
   timestamp_s: number;
-  markers: any[];
-  num_markers: number;
   timer: { state: string; elapsed_s: number };
   crossing_event: 'start' | 'finish' | null;
   calibration: { calibrated: boolean; [key: string]: any };
@@ -168,6 +159,7 @@ export interface GaitMetrics {
     step_length_cm: number | null;
     step_time_s: number | null;
     stride_length_cm: number | null;
+    stride_time_s: number | null;
   }>;
 
   // Evidence clips
@@ -296,8 +288,8 @@ export class GaitAnalysisWebSocket {
    */
   configure(config: {
     walk_distance?: number;
-    marker_size?: number;
     direction?: 'left_to_right' | 'right_to_left' | 'auto';
+    patient_height_m?: number;
   }): void {
     this.send({
       type: 'configure',

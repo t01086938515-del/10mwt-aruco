@@ -6,6 +6,7 @@ import {
   setStatus,
   setError,
   setVideoId,
+  setFileName,
   setConnected,
   setCalibration,
   updateFrame,
@@ -36,6 +37,7 @@ export function useAIAnalysis() {
     status,
     error,
     videoId,
+    fileName,
     isConnected,
     calibration,
     currentFrame,
@@ -106,13 +108,16 @@ export function useAIAnalysis() {
 
   // 영상 업로드 및 분석 시작
   const startAnalysis = useCallback(
-    async (file: File, config?: { walkDistance?: number; markerSize?: number }) => {
+    async (file: File, config?: { walkDistance?: number; patientHeightM?: number }) => {
       try {
         dispatch(prepareNewAnalysis());
         dispatch(setStatus("uploading"));
 
         const ws = getWebSocketClient(BACKEND_URL);
         wsRef.current = ws;
+
+        // 파일명 저장
+        dispatch(setFileName(file.name));
 
         // 영상 업로드
         const uploadedVideoId = await ws.uploadVideo(file);
@@ -129,8 +134,8 @@ export function useAIAnalysis() {
         // 설정 전송
         ws.configure({
           walk_distance: config?.walkDistance || 10,
-          marker_size: config?.markerSize || 0.15,
           direction: "auto",
+          patient_height_m: config?.patientHeightM,
         });
 
         // 분석 시작
@@ -190,6 +195,7 @@ export function useAIAnalysis() {
     status,
     error,
     videoId,
+    fileName,
     isConnected,
     calibration,
     currentFrame,

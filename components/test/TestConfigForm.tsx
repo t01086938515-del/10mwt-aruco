@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useAppSelector, useAppDispatch } from "@/store/hooks";
 import { setConfig, TestConfig, TestMode, CameraAngle } from "@/store/slices/testSessionSlice";
@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Badge } from "@/components/ui/badge";
-import { User, Settings, ArrowRight, Cpu, Info, Video } from "lucide-react";
+import { User, Settings, ArrowRight, Cpu, Info, Video, Ruler } from "lucide-react";
 
 export function TestConfigForm() {
   const router = useRouter();
@@ -25,15 +25,36 @@ export function TestConfigForm() {
     restDuration: config?.restDuration || 60,
     distance: config?.distance || 10,
     cameraAngle: (config?.cameraAngle || "lateral") as CameraAngle,
-    markerSize: config?.markerSize || 0.15,
+    patientHeight: config?.patientHeight || currentPatient?.height || 0,
   });
 
   const selectedPatient = patientList.find((p) => p.id === formData.patientId);
+
+  // 환자 변경 시 키 자동 연동
+  useEffect(() => {
+    if (selectedPatient?.height && formData.patientHeight === 0) {
+      setFormData((prev) => ({ ...prev, patientHeight: selectedPatient.height }));
+    }
+  }, [selectedPatient]);
+
+  const handlePatientChange = (patientId: string) => {
+    const patient = patientList.find((p) => p.id === patientId);
+    setFormData({
+      ...formData,
+      patientId,
+      patientHeight: patient?.height || formData.patientHeight,
+    });
+  };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
 
     if (!selectedPatient) return;
+
+    if (!formData.patientHeight || formData.patientHeight < 50 || formData.patientHeight > 250) {
+      alert("환자 키를 올바르게 입력해주세요 (50~250cm)");
+      return;
+    }
 
     const testConfig: TestConfig = {
       patientId: formData.patientId,
@@ -46,7 +67,7 @@ export function TestConfigForm() {
       distance: formData.distance,
       measurementMethod: "ai",
       cameraAngle: formData.cameraAngle,
-      markerSize: formData.markerSize,
+      patientHeight: formData.patientHeight,
     };
 
     dispatch(setConfig(testConfig));
@@ -71,7 +92,7 @@ export function TestConfigForm() {
         <CardContent className="p-6 pt-4">
           <Select
             value={formData.patientId}
-            onChange={(e) => setFormData({ ...formData, patientId: e.target.value })}
+            onChange={(e) => handlePatientChange(e.target.value)}
             options={patientList.map((p) => ({
               value: p.id,
               label: `${p.name} - ${p.diagnosis}`,
@@ -176,15 +197,15 @@ export function TestConfigForm() {
                 <ul className="list-inside list-disc space-y-1 text-blue-800 dark:text-blue-200">
                   {formData.cameraAngle === "lateral" ? (
                     <>
-                      <li>측정 구간 양끝에 ArUco 마커 설치</li>
                       <li>보행 경로 옆에서 촬영</li>
                       <li>전신이 보이는 카메라 앵글</li>
+                      <li>환자 키 정보로 거리 자동 보정</li>
                     </>
                   ) : (
                     <>
-                      <li>측정 구간 시작점에 ArUco 마커 설치</li>
                       <li>보행 경로 뒤에서 촬영</li>
                       <li>환자가 카메라에서 멀어지는 방향으로 보행</li>
+                      <li>전신이 보이는 카메라 앵글</li>
                     </>
                   )}
                 </ul>
@@ -195,23 +216,41 @@ export function TestConfigForm() {
             </div>
           </div>
 
-          {/* ArUco 마커 크기 */}
+          {/* 환자 키 입력 */}
           <div className="space-y-4">
-            <label className="text-sm font-medium">ArUco 마커 크기</label>
+            <label className="flex items-center gap-2 text-sm font-medium">
+              <Ruler className="h-4 w-4" />
+              환자 키 (보정용)
+            </label>
             <div className="flex items-center gap-4">
               <Input
                 type="number"
-                value={formData.markerSize}
+                value={formData.patientHeight || ""}
                 onChange={(e) =>
-                  setFormData({ ...formData, markerSize: Number(e.target.value) })
+                  setFormData({ ...formData, patientHeight: Number(e.target.value) })
                 }
-                min={0.05}
-                max={0.5}
-                step={0.01}
-                className="w-28 h-11"
+                placeholder="키를 입력하세요"
+                min={50}
+                max={250}
+                className="w-32 h-11"
               />
-              <span className="text-sm text-[hsl(var(--muted-foreground))]">m (기본: 15cm)</span>
+              <span className="text-sm text-[hsl(var(--muted-foreground))]">cm</span>
+              {selectedPatient?.height && selectedPatient.height !== formData.patientHeight && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setFormData({ ...formData, patientHeight: selectedPatient.height })}
+                >
+                  프로필 값 ({selectedPatient.height}cm)
+                </Button>
+              )}
             </div>
+            {!formData.patientHeight && (
+              <p className="text-sm text-red-500">
+                키 정보가 없으면 분석이 불가합니다
+              </p>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -322,7 +361,7 @@ export function TestConfigForm() {
         type="submit"
         className="w-full h-14 text-base"
         size="lg"
-        disabled={!selectedPatient}
+        disabled={!selectedPatient || !formData.patientHeight}
       >
         영상 업로드
         <ArrowRight className="ml-2 h-5 w-5" />

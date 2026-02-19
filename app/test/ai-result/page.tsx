@@ -181,7 +181,7 @@ export default function AIResultPage() {
   const router = useRouter();
   const dispatch = useAppDispatch();
   const { config } = useAppSelector((state) => state.testSession);
-  const { result, metrics, videoId, reset, status } = useAIAnalysis();
+  const { result, metrics, videoId, fileName, reset, status } = useAIAnalysis();
   const [waitCount, setWaitCount] = useState(0);
   const [clipModal, setClipModal] = useState<{
     open: boolean;
@@ -191,6 +191,7 @@ export default function AIResultPage() {
     variableName: string;
     foot: 'left' | 'right' | null;
     judgment: JudgmentVariable | null;
+    targetStepNum?: number;  // 개별 분석에서 정확한 스텝 지정용
   }>({ open: false, label: "", startS: 0, endS: 0, variableName: "", foot: null, judgment: null });
   const videoRef = useRef<HTMLVideoElement>(null);
   const clipCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -208,7 +209,7 @@ export default function AIResultPage() {
   const [showPlayer, setShowPlayer] = useState(true);
 
   // evidence_clips from analysis results
-  const evidenceClips: Record<string, { start_s: number; end_s: number; label: string }> =
+  const evidenceClips: Record<string, { start_s: number; end_s: number; label: string; target_step_num?: number }> =
     (result as any)?.results?.evidence_clips || {};
 
   // Pre-compute variable judgment map for clip overlays
@@ -235,6 +236,7 @@ export default function AIResultPage() {
       startS: clip.start_s, endS: clip.end_s,
       variableName, foot,
       judgment: varMap.get(variableName) || varMap.get(baseVarName) || null,
+      targetStepNum: clip.target_step_num,
     });
   }, [evidenceClips, varMap]);
 
@@ -651,15 +653,20 @@ export default function AIResultPage() {
 
       drawAnkles();
 
-      // Find clip steps
-      const clipSteps = stepEventsAll.filter(
-        s => s.time >= clipModal.startS - 0.5 && s.time <= clipModal.endS + 0.5
-      );
-      // Step: 해당 발의 첫 번째 이벤트, Stride: 해당 발의 마지막 이벤트 (같은 발 2번째 HS)
-      const footStepsInClip = foot ? clipSteps.filter(s => s.leading_foot === foot) : clipSteps;
-      const targetStep = isStride
-        ? (footStepsInClip.length > 0 ? footStepsInClip[footStepsInClip.length - 1] : clipSteps[clipSteps.length - 1])
-        : (footStepsInClip.length > 0 ? footStepsInClip[0] : clipSteps[0]);
+      // Find target step: targetStepNum이 있으면 정확한 스텝 사용, 없으면 시간 범위 검색
+      let targetStep: typeof stepEventsAll[0] | undefined;
+      if (clipModal.targetStepNum != null) {
+        targetStep = stepEventsAll.find(s => s.step_num === clipModal.targetStepNum);
+      }
+      if (!targetStep) {
+        const clipSteps = stepEventsAll.filter(
+          s => s.time >= clipModal.startS - 0.5 && s.time <= clipModal.endS + 0.5
+        );
+        const footStepsInClip = foot ? clipSteps.filter(s => s.leading_foot === foot) : clipSteps;
+        targetStep = isStride
+          ? (footStepsInClip.length > 0 ? footStepsInClip[footStepsInClip.length - 1] : clipSteps[clipSteps.length - 1])
+          : (footStepsInClip.length > 0 ? footStepsInClip[0] : clipSteps[0]);
+      }
 
       if (targetStep) {
         const stepIdx = stepEventsAll.indexOf(targetStep);
@@ -857,14 +864,20 @@ export default function AIResultPage() {
 
       drawAnkles();
 
-      // Find clip steps
-      const clipSteps = stepEventsAll.filter(
-        s => s.time >= clipModal.startS - 0.5 && s.time <= clipModal.endS + 0.5
-      );
-      const footStepsInClip = foot ? clipSteps.filter(s => s.leading_foot === foot) : clipSteps;
-      const targetStep = isStride
-        ? (footStepsInClip.length > 0 ? footStepsInClip[footStepsInClip.length - 1] : clipSteps[clipSteps.length - 1])
-        : (footStepsInClip.length > 0 ? footStepsInClip[0] : clipSteps[0]);
+      // Find target step: targetStepNum이 있으면 정확한 스텝 사용
+      let targetStep: typeof stepEventsAll[0] | undefined;
+      if (clipModal.targetStepNum != null) {
+        targetStep = stepEventsAll.find(s => s.step_num === clipModal.targetStepNum);
+      }
+      if (!targetStep) {
+        const clipSteps = stepEventsAll.filter(
+          s => s.time >= clipModal.startS - 0.5 && s.time <= clipModal.endS + 0.5
+        );
+        const footStepsInClip = foot ? clipSteps.filter(s => s.leading_foot === foot) : clipSteps;
+        targetStep = isStride
+          ? (footStepsInClip.length > 0 ? footStepsInClip[footStepsInClip.length - 1] : clipSteps[clipSteps.length - 1])
+          : (footStepsInClip.length > 0 ? footStepsInClip[0] : clipSteps[0]);
+      }
 
       if (targetStep) {
         const stepIdx = stepEventsAll.indexOf(targetStep);
@@ -884,8 +897,8 @@ export default function AIResultPage() {
           const anchorLabel = anchorFoot === 'left' ? 'L' : 'R';
           const leadLabel = leadFoot === 'left' ? 'L' : 'R';
 
-          // 실제 측정값
-          const actualTime = targetStep.step_time_s;
+          // 실제 측정값: stride이면 stride_time_s, step이면 step_time_s
+          const actualTime = isStride ? targetStep.stride_time_s : targetStep.step_time_s;
           const hs1Time = prevStep.time;
           const hs2Time = targetStep.time;
 
@@ -1254,11 +1267,9 @@ export default function AIResultPage() {
   };
 
   const getSymmetryStatus = (value: number | null) => {
-    if (value === null) return { label: "-", color: "text-gray-400" };
-    if (value <= 5) return { label: "우수", color: "text-green-600" };
-    if (value <= 10) return { label: "양호", color: "text-blue-600" };
-    if (value <= 15) return { label: "주의", color: "text-yellow-600" };
-    return { label: "비대칭", color: "text-red-600" };
+    if (value === null) return { label: "-", color: "text-gray-400", bg: "bg-gray-50", border: "border-gray-200" };
+    if (value < 10) return { label: "정상", color: "text-green-700", bg: "bg-green-50", border: "border-green-200" };
+    return { label: "비대칭", color: "text-red-700", bg: "bg-red-50", border: "border-red-200" };
   };
 
   const judgment = metrics.judgment as GaitJudgment | undefined;
@@ -1296,6 +1307,7 @@ export default function AIResultPage() {
               <p className="font-semibold text-green-700">AI 분석 완료</p>
               <p className="text-sm text-green-600">
                 {result.total_frames_analyzed}프레임 분석 완료
+                {fileName && <span className="ml-2 text-green-500">| {fileName}</span>}
               </p>
             </div>
           </CardContent>
@@ -1662,6 +1674,7 @@ export default function AIResultPage() {
               <Footprints className="h-5 w-5" />
               거리 대칭성
             </CardTitle>
+            <p className="text-xs text-gray-500 mt-1">전체 보행 구간의 L/R 평균값 기반</p>
           </CardHeader>
           <CardContent>
             <table className="w-full text-sm">
@@ -1736,15 +1749,28 @@ export default function AIResultPage() {
           </CardContent>
         </Card>
 
-        {/* ═══ 개별 스텝 분석 ═══ */}
-        {stepEventsAll.length > 1 && timelineMeta && (
+        {/* ═══ 개별 스텝 분석 (Step) ═══ */}
+        {stepEventsAll.length > 1 && timelineMeta && (() => {
+          const validSteps = stepEventsAll.filter(s => s.step_length_cm != null);
+          const meanStep = validSteps.length > 0
+            ? validSteps.reduce((a, b) => a + b.step_length_cm!, 0) / validSteps.length : 0;
+          const leftSteps = validSteps.filter(s => s.leading_foot === 'left');
+          const rightSteps = validSteps.filter(s => s.leading_foot === 'right');
+          const leftAvg = leftSteps.length > 0 ? leftSteps.reduce((a, b) => a + b.step_length_cm!, 0) / leftSteps.length : 0;
+          const rightAvg = rightSteps.length > 0 ? rightSteps.reduce((a, b) => a + b.step_length_cm!, 0) / rightSteps.length : 0;
+          const leftMin = leftSteps.length > 0 ? Math.min(...leftSteps.map(s => s.step_length_cm!)) : 0;
+          const leftMax = leftSteps.length > 0 ? Math.max(...leftSteps.map(s => s.step_length_cm!)) : 0;
+          const rightMin = rightSteps.length > 0 ? Math.min(...rightSteps.map(s => s.step_length_cm!)) : 0;
+          const rightMax = rightSteps.length > 0 ? Math.max(...rightSteps.map(s => s.step_length_cm!)) : 0;
+
+          return (
           <Card className="mb-6">
             <CardHeader className="pb-2">
               <CardTitle className="flex items-center gap-2 text-lg">
                 <Footprints className="h-5 w-5" />
-                개별 스텝 분석
+                개별 Step 분석
               </CardTitle>
-              <p className="text-xs text-gray-500 mt-1">각 스텝의 보폭/활보장을 개별 확인</p>
+              <p className="text-xs text-gray-500 mt-1">각 스텝의 보폭(반대발→이 발)을 개별 확인</p>
             </CardHeader>
             <CardContent className="p-0">
               <div className="overflow-x-auto">
@@ -1753,25 +1779,18 @@ export default function AIResultPage() {
                     <tr className="border-b bg-gray-50">
                       <th className="text-center py-2 px-2 font-medium text-gray-500 w-10">#</th>
                       <th className="text-center py-2 px-1 font-medium text-gray-500 w-10">발</th>
-                      <th className="text-center py-2 px-1 font-medium text-gray-500">Step (cm)</th>
-                      <th className="text-center py-2 px-1 font-medium text-gray-500">Stride (cm)</th>
-                      <th className="text-center py-2 px-1 font-medium text-gray-500">Time (s)</th>
+                      <th className="text-center py-2 px-1 font-medium text-gray-500">보폭 (cm)</th>
+                      <th className="text-center py-2 px-1 font-medium text-gray-500">시간 (s)</th>
                       <th className="text-center py-2 px-1 font-medium text-gray-500 w-10"></th>
                     </tr>
                   </thead>
                   <tbody>
-                    {stepEventsAll.map((step, idx) => {
+                    {stepEventsAll.filter(s => s.step_length_cm != null).map((step, idx) => {
                       const isLeft = step.leading_foot === 'left';
                       const footColor = isLeft ? 'text-blue-600' : 'text-red-600';
                       const bgColor = isLeft ? 'bg-blue-50/50' : 'bg-red-50/50';
-                      // Highlight outliers (>20% from mean)
-                      const allStepCms = stepEventsAll
-                        .filter(s => s.step_length_cm != null)
-                        .map(s => s.step_length_cm!);
-                      const meanStep = allStepCms.length > 0
-                        ? allStepCms.reduce((a, b) => a + b, 0) / allStepCms.length : 0;
-                      const isOutlier = step.step_length_cm != null && meanStep > 0
-                        && Math.abs(step.step_length_cm - meanStep) / meanStep > 0.2;
+                      const isOutlier = meanStep > 0
+                        && Math.abs(step.step_length_cm! - meanStep) / meanStep > 0.2;
 
                       return (
                         <tr key={idx} className={`border-b last:border-b-0 ${bgColor}`}>
@@ -1782,15 +1801,10 @@ export default function AIResultPage() {
                             {isLeft ? 'L' : 'R'}
                           </td>
                           <td className={`text-center py-2 px-1 font-mono font-bold ${isOutlier ? 'text-orange-600' : ''}`}>
-                            {step.step_length_cm != null ? (
-                              <span className="flex items-center justify-center gap-1">
-                                {step.step_length_cm.toFixed(1)}
-                                {isOutlier && <AlertTriangle className="h-3 w-3 text-orange-500" />}
-                              </span>
-                            ) : '-'}
-                          </td>
-                          <td className="text-center py-2 px-1 font-mono">
-                            {step.stride_length_cm != null ? step.stride_length_cm.toFixed(1) : '-'}
+                            <span className="flex items-center justify-center gap-1">
+                              {step.step_length_cm!.toFixed(1)}
+                              {isOutlier && <AlertTriangle className="h-3 w-3 text-orange-500" />}
+                            </span>
                           </td>
                           <td className="text-center py-2 px-1 font-mono text-gray-600">
                             {step.step_time_s != null ? step.step_time_s.toFixed(3) : '-'}
@@ -1798,8 +1812,9 @@ export default function AIResultPage() {
                           <td className="text-center py-2 px-1">
                             <button
                               onClick={() => {
-                                const clipStart = Math.max(timelineMeta?.start_t || 0, step.time - 0.5);
-                                const clipEnd = step.time + 0.5;
+                                const prevStep = stepEventsAll[stepEventsAll.indexOf(step) - 1];
+                                const clipStart = prevStep ? prevStep.time - 0.1 : step.time - 0.3;
+                                const clipEnd = step.time + 0.15;
                                 const vn = isLeft ? 'left_step_length_cm' : 'right_step_length_cm';
                                 setClipModal({
                                   open: true,
@@ -1809,6 +1824,7 @@ export default function AIResultPage() {
                                   variableName: vn,
                                   foot: step.leading_foot,
                                   judgment: varMap.get(vn) || null,
+                                  targetStepNum: step.step_num,
                                 });
                               }}
                               className={`p-1 rounded transition-colors ${isLeft ? 'bg-blue-100 hover:bg-blue-200' : 'bg-red-100 hover:bg-red-200'}`}
@@ -1823,34 +1839,126 @@ export default function AIResultPage() {
                   </tbody>
                 </table>
               </div>
-              {/* Summary bar */}
-              {(() => {
-                const leftSteps = stepEventsAll.filter(s => s.leading_foot === 'left' && s.step_length_cm != null);
-                const rightSteps = stepEventsAll.filter(s => s.leading_foot === 'right' && s.step_length_cm != null);
-                const leftAvg = leftSteps.length > 0
-                  ? leftSteps.reduce((a, b) => a + b.step_length_cm!, 0) / leftSteps.length : 0;
-                const rightAvg = rightSteps.length > 0
-                  ? rightSteps.reduce((a, b) => a + b.step_length_cm!, 0) / rightSteps.length : 0;
-                const leftMin = leftSteps.length > 0 ? Math.min(...leftSteps.map(s => s.step_length_cm!)) : 0;
-                const leftMax = leftSteps.length > 0 ? Math.max(...leftSteps.map(s => s.step_length_cm!)) : 0;
-                const rightMin = rightSteps.length > 0 ? Math.min(...rightSteps.map(s => s.step_length_cm!)) : 0;
-                const rightMax = rightSteps.length > 0 ? Math.max(...rightSteps.map(s => s.step_length_cm!)) : 0;
-                return (
-                  <div className="px-4 py-3 bg-gray-50 border-t grid grid-cols-2 gap-3 text-xs">
-                    <div className="rounded-lg bg-blue-50 px-3 py-2 border border-blue-100">
-                      <p className="font-bold text-blue-700 mb-1">L 평균: {leftAvg.toFixed(1)}cm</p>
-                      <p className="text-blue-500">범위: {leftMin.toFixed(0)}~{leftMax.toFixed(0)}cm ({leftSteps.length}회)</p>
-                    </div>
-                    <div className="rounded-lg bg-red-50 px-3 py-2 border border-red-100">
-                      <p className="font-bold text-red-700 mb-1">R 평균: {rightAvg.toFixed(1)}cm</p>
-                      <p className="text-red-500">범위: {rightMin.toFixed(0)}~{rightMax.toFixed(0)}cm ({rightSteps.length}회)</p>
-                    </div>
-                  </div>
-                );
-              })()}
+              <div className="px-4 py-3 bg-gray-50 border-t grid grid-cols-2 gap-3 text-xs">
+                <div className="rounded-lg bg-blue-50 px-3 py-2 border border-blue-100">
+                  <p className="font-bold text-blue-700 mb-1">L 평균: {leftAvg.toFixed(1)}cm</p>
+                  <p className="text-blue-500">범위: {leftMin.toFixed(0)}~{leftMax.toFixed(0)}cm ({leftSteps.length}회)</p>
+                </div>
+                <div className="rounded-lg bg-red-50 px-3 py-2 border border-red-100">
+                  <p className="font-bold text-red-700 mb-1">R 평균: {rightAvg.toFixed(1)}cm</p>
+                  <p className="text-red-500">범위: {rightMin.toFixed(0)}~{rightMax.toFixed(0)}cm ({rightSteps.length}회)</p>
+                </div>
+              </div>
             </CardContent>
           </Card>
-        )}
+          );
+        })()}
+
+        {/* ═══ 개별 Stride 분석 ═══ */}
+        {stepEventsAll.length > 2 && timelineMeta && (() => {
+          const validStrides = stepEventsAll.filter(s => s.stride_length_cm != null);
+          if (validStrides.length === 0) return null;
+          const meanStride = validStrides.reduce((a, b) => a + b.stride_length_cm!, 0) / validStrides.length;
+          const leftStrides = validStrides.filter(s => s.leading_foot === 'left');
+          const rightStrides = validStrides.filter(s => s.leading_foot === 'right');
+          const leftAvg = leftStrides.length > 0 ? leftStrides.reduce((a, b) => a + b.stride_length_cm!, 0) / leftStrides.length : 0;
+          const rightAvg = rightStrides.length > 0 ? rightStrides.reduce((a, b) => a + b.stride_length_cm!, 0) / rightStrides.length : 0;
+          const leftMin = leftStrides.length > 0 ? Math.min(...leftStrides.map(s => s.stride_length_cm!)) : 0;
+          const leftMax = leftStrides.length > 0 ? Math.max(...leftStrides.map(s => s.stride_length_cm!)) : 0;
+          const rightMin = rightStrides.length > 0 ? Math.min(...rightStrides.map(s => s.stride_length_cm!)) : 0;
+          const rightMax = rightStrides.length > 0 ? Math.max(...rightStrides.map(s => s.stride_length_cm!)) : 0;
+
+          return (
+          <Card className="mb-6">
+            <CardHeader className="pb-2">
+              <CardTitle className="flex items-center gap-2 text-lg">
+                <Activity className="h-5 w-5" />
+                개별 Stride 분석
+              </CardTitle>
+              <p className="text-xs text-gray-500 mt-1">각 활보장(같은 발 1보행주기)을 개별 확인</p>
+            </CardHeader>
+            <CardContent className="p-0">
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b bg-gray-50">
+                      <th className="text-center py-2 px-2 font-medium text-gray-500 w-10">#</th>
+                      <th className="text-center py-2 px-1 font-medium text-gray-500 w-10">발</th>
+                      <th className="text-center py-2 px-1 font-medium text-gray-500">활보장 (cm)</th>
+                      <th className="text-center py-2 px-1 font-medium text-gray-500">시간 (s)</th>
+                      <th className="text-center py-2 px-1 font-medium text-gray-500 w-10"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {validStrides.map((step, idx) => {
+                      const isLeft = step.leading_foot === 'left';
+                      const footColor = isLeft ? 'text-blue-600' : 'text-red-600';
+                      const bgColor = isLeft ? 'bg-blue-50/50' : 'bg-red-50/50';
+                      const isOutlier = meanStride > 0
+                        && Math.abs(step.stride_length_cm! - meanStride) / meanStride > 0.2;
+
+                      return (
+                        <tr key={idx} className={`border-b last:border-b-0 ${bgColor}`}>
+                          <td className="text-center py-2 px-2 text-xs text-gray-400 font-mono">
+                            {step.step_num}
+                          </td>
+                          <td className={`text-center py-2 px-1 font-bold text-xs ${footColor}`}>
+                            {isLeft ? 'L' : 'R'}
+                          </td>
+                          <td className={`text-center py-2 px-1 font-mono font-bold ${isOutlier ? 'text-orange-600' : ''}`}>
+                            <span className="flex items-center justify-center gap-1">
+                              {step.stride_length_cm!.toFixed(1)}
+                              {isOutlier && <AlertTriangle className="h-3 w-3 text-orange-500" />}
+                            </span>
+                          </td>
+                          <td className="text-center py-2 px-1 font-mono text-gray-600">
+                            {step.stride_time_s != null ? step.stride_time_s.toFixed(3) : '-'}
+                          </td>
+                          <td className="text-center py-2 px-1">
+                            <button
+                              onClick={() => {
+                                const allIdx = stepEventsAll.indexOf(step);
+                                const anchorStep = allIdx >= 2 ? stepEventsAll[allIdx - 2] : step;
+                                const clipStart = anchorStep.time - 0.1;
+                                const clipEnd = step.time + 0.15;
+                                const vn = isLeft ? 'left_stride_length_cm' : 'right_stride_length_cm';
+                                setClipModal({
+                                  open: true,
+                                  label: `Stride #${step.step_num} (${isLeft ? 'L' : 'R'})`,
+                                  startS: clipStart,
+                                  endS: clipEnd,
+                                  variableName: vn,
+                                  foot: step.leading_foot,
+                                  judgment: varMap.get(vn) || null,
+                                  targetStepNum: step.step_num,
+                                });
+                              }}
+                              className={`p-1 rounded transition-colors ${isLeft ? 'bg-blue-100 hover:bg-blue-200' : 'bg-red-100 hover:bg-red-200'}`}
+                              title={`Stride #${step.step_num} 재생`}
+                            >
+                              <Play className={`h-3 w-3 ${footColor}`} />
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <div className="px-4 py-3 bg-gray-50 border-t grid grid-cols-2 gap-3 text-xs">
+                <div className="rounded-lg bg-blue-50 px-3 py-2 border border-blue-100">
+                  <p className="font-bold text-blue-700 mb-1">L 평균: {leftAvg.toFixed(1)}cm</p>
+                  <p className="text-blue-500">범위: {leftMin.toFixed(0)}~{leftMax.toFixed(0)}cm ({leftStrides.length}회)</p>
+                </div>
+                <div className="rounded-lg bg-red-50 px-3 py-2 border border-red-100">
+                  <p className="font-bold text-red-700 mb-1">R 평균: {rightAvg.toFixed(1)}cm</p>
+                  <p className="text-red-500">범위: {rightMin.toFixed(0)}~{rightMax.toFixed(0)}cm ({rightStrides.length}회)</p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+          );
+        })()}
 
         {/* ═══ 4. 좌우 대칭성 - 시간 ═══ */}
         <Card className="mb-6">
@@ -1859,6 +1967,7 @@ export default function AIResultPage() {
               <Clock className="h-5 w-5" />
               시간 대칭성
             </CardTitle>
+            <p className="text-xs text-gray-500 mt-1">전체 보행 구간의 L/R 평균값 기반</p>
           </CardHeader>
           <CardContent>
             <table className="w-full text-sm">
@@ -1980,7 +2089,7 @@ export default function AIResultPage() {
               <BarChart3 className="h-5 w-5" />
               비율 대칭성
             </CardTitle>
-            <p className="text-xs text-gray-500 mt-1">정상: Swing 40% / Stance 60%</p>
+            <p className="text-xs text-gray-500 mt-1">전체 보행 구간의 L/R 평균값 기반 · 정상: Swing 40% / Stance 60%</p>
           </CardHeader>
           <CardContent>
             <table className="w-full text-sm">
@@ -2022,7 +2131,9 @@ export default function AIResultPage() {
                   <td className="text-center font-mono font-bold">
                     {metrics.right_stance_pct?.toFixed(0) || "-"}
                   </td>
-                  <td className="text-center font-mono font-bold text-gray-400">-</td>
+                  <td className={`text-center font-mono font-bold ${getSymmetryStatus(metrics.swing_stance_si).color}`}>
+                    {metrics.swing_stance_si?.toFixed(0) || "-"}
+                  </td>
                   <td className="text-center py-2">
                     {evidenceClips['stance_ratio_pct'] && (
                       <button onClick={() => openClip('stance_ratio_pct')}
@@ -2036,19 +2147,53 @@ export default function AIResultPage() {
             </table>
 
             {/* 종합 대칭성 지수 */}
-            {metrics.overall_symmetry_index !== null && (
-              <div className="mt-4 flex items-center justify-between rounded-lg bg-blue-50 px-4 py-3 border border-blue-200">
-                <span className="text-sm font-medium text-blue-700">종합 대칭성 지수 (Overall SI)</span>
-                <div className="flex items-center gap-3">
-                  <span className="font-mono text-xl font-bold text-blue-700">
-                    {metrics.overall_symmetry_index?.toFixed(1)}%
-                  </span>
-                  <span className={`text-sm font-medium ${getSymmetryStatus(metrics.overall_symmetry_index).color}`}>
-                    {getSymmetryStatus(metrics.overall_symmetry_index).label}
-                  </span>
+            {metrics.overall_symmetry_index !== null && (() => {
+              const siValue = metrics.overall_symmetry_index!;
+              const siStatus = getSymmetryStatus(siValue);
+              return (
+                <div className={`mt-4 rounded-lg border p-4 ${siStatus.bg} ${siStatus.border}`}>
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="text-sm font-medium text-gray-700">종합 대칭성 지수 (Overall SI)</span>
+                    <div className="flex items-center gap-2">
+                      <span className={`font-mono text-2xl font-bold ${siStatus.color}`}>
+                        {siValue.toFixed(1)}%
+                      </span>
+                      <span className={`text-sm font-bold px-2 py-0.5 rounded ${siStatus.color} ${siStatus.bg}`}>
+                        {siStatus.label}
+                      </span>
+                    </div>
+                  </div>
+                  {/* 시각적 바 */}
+                  <div className="relative h-3 rounded-full bg-gray-200 mb-2">
+                    <div
+                      className={`h-full rounded-full transition-all ${siValue < 10 ? "bg-green-500" : "bg-red-500"}`}
+                      style={{ width: `${Math.min(siValue / 30 * 100, 100)}%` }}
+                    />
+                    {/* 10% 기준선 */}
+                    <div
+                      className="absolute top-0 h-full w-0.5 bg-gray-600"
+                      style={{ left: `${10 / 30 * 100}%` }}
+                    />
+                  </div>
+                  <div className="flex justify-between text-xs text-gray-500 mb-3">
+                    <span>0% (완전 대칭)</span>
+                    <span className="font-medium text-gray-600" style={{ marginLeft: `${10 / 30 * 100 - 8}%` }}>10% 기준</span>
+                    <span>30%+</span>
+                  </div>
+                  {/* 해석 */}
+                  <div className="text-xs text-gray-500 leading-relaxed space-y-1">
+                    <p>
+                      {siValue < 10
+                        ? "좌우 보행이 대칭적입니다. 정상 범위 내 대칭성을 보입니다."
+                        : `좌우 보행에 비대칭이 관찰됩니다 (SI ${siValue.toFixed(1)}%). 임상적 평가가 권장됩니다.`}
+                    </p>
+                    <p className="text-gray-400">
+                      기준: SI &lt; 10% 정상 (Patterson et al. 2010; Herzog et al. 1989)
+                    </p>
+                  </div>
                 </div>
-              </div>
-            )}
+              );
+            })()}
           </CardContent>
         </Card>
 

@@ -29,7 +29,7 @@ export interface TestConfig {
   // AI 분석 관련
   measurementMethod: MeasurementMethod;
   cameraAngle: CameraAngle; // 촬영 각도: 측면 | 후면
-  markerSize?: number; // ArUco 마커 크기 (m), 기본 0.15
+  patientHeight?: number; // 환자 키 (cm), 보정용
 }
 
 export interface TestSession {
